@@ -165,7 +165,13 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	votes := make(map[uint64]bool)
+	Prs := make(map[uint64]*Progress)
+	for _, i := range c.peers {
+		votes[i] = false
+		Prs[i] = nil
+	}
+	return &Raft{id: c.ID, electionTimeout: c.ElectionTick, heartbeatTimeout: c.HeartbeatTick, votes: votes, Prs: Prs}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,37 +184,151 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat}
+	r.msgs = append(r.msgs, msg)
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.electionElapsed++
+	if r.electionElapsed >= r.electionTimeout {
+		msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
+		//r.msgs = append(r.msgs, msg)
+		r.electionElapsed = 0
+		r.Step(msg)
+
+	}
+	if r.State == StateLeader {
+		r.heartbeatElapsed++
+		// Leader对每个peer发送一个heartbeat请求
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			for key := range r.votes {
+				if key != r.id {
+					r.sendHeartbeat(key)
+				}
+			}
+		}
+	}
+
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	// change the state of raft node
+	r.State = StateFollower
+	// change the leader
+	r.Lead = lead
+	// increment the term
+	r.Term = term
+
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	// change the state tot Candidate and increment the term
+	r.State = StateCandidate
+	r.Term++
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.Lead = r.id
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		// start new election
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			// Candidate vote for self
+			r.votes[r.id] = true
+			for key := range r.votes {
+				if key != r.id {
+					msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term}
+					r.msgs = append(r.msgs, msg)
+				}
+			}
+			if len(r.votes) == 1 {
+				r.becomeLeader()
+			}
+		case pb.MessageType_MsgRequestVote:
+			if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
+				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse}
+				r.msgs = append(r.msgs, msg)
+				r.electionElapsed = 0
+				r.Vote = m.From
+			} else {
+				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true}
+				r.msgs = append(r.msgs, msg)
+			}
+		case pb.MessageType_MsgAppend:
+			// 当前的Term小于Append
+			if m.Term > r.Term {
+				r.Term = m.Term
+			}
+		}
+
 	case StateCandidate:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			// Candidate vote for self
+			r.votes[r.id] = true
+			for key := range r.votes {
+				if key != r.id {
+					msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term}
+					r.msgs = append(r.msgs, msg)
+				}
+			}
+			if len(r.votes) == 1 {
+				r.becomeLeader()
+			}
+		case pb.MessageType_MsgRequestVoteResponse:
+			if !m.Reject {
+				r.votes[m.From] = true
+				trueCount := 0
+				// 统计投票的数量
+				for _, vote := range r.votes {
+					if vote {
+						trueCount++
+					}
+				}
+				// 获取 votes 的总数量
+				totalCount := len(r.votes)
+				if trueCount > totalCount/2 {
+					// 得到超过一半的票，成为leader
+					r.becomeLeader()
+				}
+			}
+		case pb.MessageType_MsgAppend:
+			{
+				if m.Term > r.Term {
+					r.becomeFollower(m.Term, m.From)
+				}
+			}
+		}
+
 	case StateLeader:
+		switch m.MsgType {
+		case pb.MessageType_MsgAppend:
+			{
+				if m.Term > r.Term {
+					r.becomeFollower(m.Term, m.From)
+				}
+			}
+		}
 	}
 	return nil
 }
