@@ -169,16 +169,41 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
+	hs, _, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err) // TODO(bdarnell)
+	}
 	// Your Code Here (2A).
 	votes := make(map[uint64]bool)
 	Prs := make(map[uint64]*Progress)
 	for _, i := range c.peers {
-		votes[i] = false
+		// votes[i] = false
 		Prs[i] = &Progress{Next: 1, Match: 0}
 	}
 	log := newLog(c.Storage)
+	raft := Raft{
+		id:                        c.ID,
+		electionTimeout:           c.ElectionTick,
+		heartbeatTimeout:          c.HeartbeatTick,
+		votes:                     votes,
+		Prs:                       Prs,
+		randomizedElectionTimeout: c.ElectionTick,
+		RaftLog:                   log,
+	}
+	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
+		raft.loadState(hs)
+	}
+	return &raft
+}
 
-	return &Raft{id: c.ID, electionTimeout: c.ElectionTick, heartbeatTimeout: c.HeartbeatTick, votes: votes, Prs: Prs, randomizedElectionTimeout: c.ElectionTick, RaftLog: log}
+// 加载Storage中的HardState
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		log.Panicf("%x state.commit %d is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+	r.RaftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -202,8 +227,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	} else {
 		msg.Entries = entry
-		msg.LogTerm = entry[0].Term
 		msg.Index = entry[0].Index - 1
+		msg.LogTerm, _ = r.RaftLog.Term(msg.Index)
 		msg.Commit = r.RaftLog.committed
 		// log.Printf("The Append entry is %v\n", entry[0])
 	}
@@ -237,7 +262,7 @@ func (r *Raft) tick() {
 		// Leader对每个peer发送一个heartbeat请求
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
-			for key := range r.votes {
+			for key := range r.Prs {
 				if key != r.id {
 					r.sendHeartbeat(key)
 				}
@@ -264,6 +289,11 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	// change the state tot Candidate and increment the term
 	r.State = StateCandidate
+	r.votes = make(map[uint64]bool)
+	r.Vote = None
+	r.Lead = None
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
 	r.Term++
 }
 
@@ -276,7 +306,8 @@ func (r *Raft) becomeLeader() {
 	// Leader propose a noop entry
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.entries = append(r.RaftLog.entries, entry)
-	for id := range r.votes {
+	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+	for id := range r.Prs {
 		if id != r.id {
 			r.sendAppend(id)
 		}
@@ -284,11 +315,40 @@ func (r *Raft) becomeLeader() {
 
 }
 
+func (r *Raft) isUpToDate(e pb.Entry) bool {
+	index := r.RaftLog.LastIndex()
+	term, _ := r.RaftLog.Term(index)
+	if term < e.Term {
+		return true
+	} else if term == e.Term {
+		if index <= e.Index {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 
+	if m.MsgType == pb.MessageType_MsgRequestVote {
+		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
+		CanVote := m.Term > r.Term || r.Vote == None || r.Vote == m.From
+		if CanVote && r.isUpToDate(entry) {
+			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
+			r.msgs = append(r.msgs, msg)
+			r.electionElapsed = 0
+			r.Vote = m.From
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
+			r.msgs = append(r.msgs, msg)
+		}
+		return nil
+	}
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
@@ -296,27 +356,31 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
 			// Candidate vote for self
-			r.votes[r.id] = true
-			for key := range r.votes {
+			// r.votes[r.id] = true
+			for key := range r.Prs {
 				if key != r.id {
-					msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term}
+					index := r.RaftLog.LastIndex()
+					term, _ := r.RaftLog.Term(index)
+					log.Printf("Candidate [%d] Send [logterm %d, index %d] to Vote\n", r.id, term, index)
+					msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
+					r.msgs = append(r.msgs, msg)
+				} else {
+					// Candidate为自己投票
+					msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
 					r.msgs = append(r.msgs, msg)
 				}
 			}
-			if len(r.votes) == 1 {
-				r.becomeLeader()
-			}
-		case pb.MessageType_MsgRequestVote:
-			if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-				r.electionElapsed = 0
-				r.Vote = m.From
-				r.becomeFollower(m.Term, m.From)
-			} else {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-			}
+		// case pb.MessageType_MsgRequestVote:
+		// 	if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
+		// 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
+		// 		r.msgs = append(r.msgs, msg)
+		// 		r.electionElapsed = 0
+		// 		r.Vote = m.From
+		// 		r.becomeFollower(m.Term, m.From)
+		// 	} else {
+		// 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
+		// 		r.msgs = append(r.msgs, msg)
+		// 	}
 		case pb.MessageType_MsgAppend:
 			// 当前的Term小于Append
 			log.Printf("[%d] Received Append RPC from [%d]", m.To, m.From)
@@ -329,27 +393,17 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
 			// Candidate vote for self
-			r.votes[r.id] = true
-			for key := range r.votes {
+			for key := range r.Prs {
 				if key != r.id {
 					msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term}
 					r.msgs = append(r.msgs, msg)
+				} else {
+					// Candidate为自己投票
+					msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
+					r.msgs = append(r.msgs, msg)
 				}
 			}
-			if len(r.votes) == 1 {
-				r.becomeLeader()
-			}
-		case pb.MessageType_MsgRequestVote:
-			if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-				r.electionElapsed = 0
-				r.Vote = m.From
-				r.becomeFollower(m.Term, m.From)
-			} else {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-			}
+
 		case pb.MessageType_MsgRequestVoteResponse:
 			if !m.Reject {
 				r.votes[m.From] = true
@@ -360,11 +414,22 @@ func (r *Raft) Step(m pb.Message) error {
 						trueCount++
 					}
 				}
-				// 获取 votes 的总数量
-				totalCount := len(r.votes)
-				if trueCount > totalCount/2 {
+
+				if trueCount >= r.quorum() {
 					// 得到超过一半的票，成为leader
 					r.becomeLeader()
+				}
+			} else {
+				r.votes[m.From] = false
+				falseCount := 0
+				// 统计拒绝数量
+				for _, vote := range r.votes {
+					if !vote {
+						falseCount++
+					}
+				}
+				if falseCount >= r.quorum() {
+					r.becomeFollower(m.Term, None)
 				}
 			}
 		case pb.MessageType_MsgAppend:
@@ -386,22 +451,23 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgAppend:
 			{
 				if m.Term >= r.Term {
+					// log.Printf("Leader [%d] become Follower\n", r.id)
 					r.becomeFollower(m.Term, m.From)
 				}
 			}
-		case pb.MessageType_MsgRequestVote:
-			if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-				r.electionElapsed = 0
-				r.Vote = m.From
-				r.becomeFollower(m.Term, m.From)
-			} else {
-				msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
-				r.msgs = append(r.msgs, msg)
-			}
+		// case pb.MessageType_MsgRequestVote:
+		// 	if m.Term > r.Term || r.Vote == None || r.Vote == m.From {
+		// 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
+		// 		r.msgs = append(r.msgs, msg)
+		// 		r.electionElapsed = 0
+		// 		r.Vote = m.From
+		// 		r.becomeFollower(m.Term, m.From)
+		// 	} else {
+		// 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
+		// 		r.msgs = append(r.msgs, msg)
+		// 	}
 		case pb.MessageType_MsgBeat:
-			for id := range r.votes {
+			for id := range r.Prs {
 				if r.id != id {
 					msg := pb.Message{From: r.id, To: id, MsgType: pb.MessageType_MsgHeartbeat}
 					r.msgs = append(r.msgs, msg)
@@ -414,7 +480,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 			r.maybeCommit()
 			log.Printf("After Propose, Raftlog Entry Length is %d\n", len(r.RaftLog.entries))
-			for id := range r.votes {
+			for id := range r.Prs {
 				if r.id != id {
 					r.sendAppend(id)
 				}
@@ -429,8 +495,10 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 				if r.maybeCommit() {
 					// 更新follower的commited
-					for id := range r.votes {
-						r.sendAppend(id)
+					for id := range r.Prs {
+						if id != r.id {
+							r.sendAppend(id)
+						}
 					}
 				}
 			} else {
