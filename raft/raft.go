@@ -16,7 +16,9 @@ package raft
 
 import (
 	"errors"
+	"log"
 	"math/rand"
+	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -172,16 +174,40 @@ func newRaft(c *Config) *Raft {
 	Prs := make(map[uint64]*Progress)
 	for _, i := range c.peers {
 		votes[i] = false
-		Prs[i] = nil
+		Prs[i] = &Progress{Next: 1, Match: 0}
 	}
-	return &Raft{id: c.ID, electionTimeout: c.ElectionTick, heartbeatTimeout: c.HeartbeatTick, votes: votes, Prs: Prs, randomizedElectionTimeout: c.ElectionTick}
+	log := newLog(c.Storage)
+
+	return &Raft{id: c.ID, electionTimeout: c.ElectionTick, heartbeatTimeout: c.HeartbeatTick, votes: votes, Prs: Prs, randomizedElectionTimeout: c.ElectionTick, RaftLog: log}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	entry := []*pb.Entry{}
 	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgAppend}
+	// 将entry[commited:]发送给peer
+	log.Printf("[%d] Send Append RPC Entry[%d:%d] to [%d]", r.id, r.RaftLog.committed+1, r.RaftLog.LastIndex(), to)
+	for i := r.RaftLog.committed + 1; i <= r.RaftLog.LastIndex(); i++ {
+		entry = append(entry, &r.RaftLog.entries[i-1])
+	}
+	if len(entry) == 0 {
+		// no new entry, send noop entry
+		entry = append(entry, &pb.Entry{Data: nil})
+		msg.Entries = entry
+		msg.Index = r.Prs[r.id].Next - 1
+		msg.LogTerm, _ = r.RaftLog.Term(msg.Index)
+		msg.Commit = r.RaftLog.committed
+
+	} else {
+		msg.Entries = entry
+		msg.LogTerm = entry[0].Term
+		msg.Index = entry[0].Index - 1
+		msg.Commit = r.RaftLog.committed
+		// log.Printf("The Append entry is %v\n", entry[0])
+	}
+
 	r.msgs = append(r.msgs, msg)
 	return true
 }
@@ -189,7 +215,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat}
+	// 发送一个空的Heartbeat RPC
+	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat, Entries: []*pb.Entry{{}}}
 	r.msgs = append(r.msgs, msg)
 }
 
@@ -247,6 +274,8 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 	// Leader propose a noop entry
+	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
+	r.RaftLog.entries = append(r.RaftLog.entries, entry)
 	for id := range r.votes {
 		if id != r.id {
 			r.sendAppend(id)
@@ -290,9 +319,9 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgAppend:
 			// 当前的Term小于Append
-			if m.Term >= r.Term {
-				r.Term = m.Term
-			}
+			log.Printf("[%d] Received Append RPC from [%d]", m.To, m.From)
+			r.handleAppendEntries(m)
+
 		}
 
 	case StateCandidate:
@@ -378,14 +407,123 @@ func (r *Raft) Step(m pb.Message) error {
 					r.msgs = append(r.msgs, msg)
 				}
 			}
+		case pb.MessageType_MsgPropose:
+			log.Printf("Receive Propose signal!\n")
+			entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
+			r.RaftLog.entries = append(r.RaftLog.entries, entry)
+			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+			r.maybeCommit()
+			log.Printf("After Propose, Raftlog Entry Length is %d\n", len(r.RaftLog.entries))
+			for id := range r.votes {
+				if r.id != id {
+					r.sendAppend(id)
+				}
+			}
+
+		case pb.MessageType_MsgAppendResponse:
+			if !m.Reject {
+				pr := r.Prs[m.From]
+				if pr.Match < m.Index {
+					pr.Next = m.Index + 1
+					pr.Match = m.Index
+				}
+				if r.maybeCommit() {
+					// 更新follower的commited
+					for id := range r.votes {
+						r.sendAppend(id)
+					}
+				}
+			} else {
+				// append失败的index,减1继续发送append请求
+
+				index := m.Index - 1
+				entry := []*pb.Entry{}
+				msg := pb.Message{From: r.id, To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgAppend}
+				for i := index; i <= r.RaftLog.LastIndex(); i++ {
+					entry = append(entry, &r.RaftLog.entries[i-1])
+				}
+				msg.Entries = entry
+				msg.LogTerm = entry[0].Term
+				msg.Index = entry[0].Index - 1
+				msg.Commit = r.RaftLog.committed
+				r.msgs = append(r.msgs, msg)
+				log.Printf("[%d] retry to append [logterm: %d, index: %d] to [%d]\n", r.id, msg.LogTerm, msg.Index+1, m.From)
+			}
+
 		}
 	}
 	return nil
 }
 
+// 超过半数的节点数量
+func (r *Raft) quorum() int { return len(r.Prs)/2 + 1 }
+
+// 尝试commit当前的日志，如果commit日志索引发生变化了就返回true
+func (r *Raft) maybeCommit() bool {
+	mis := make(uint64Slice, 0, len(r.Prs))
+	// 拿到当前所有节点的Match到数组中
+	for id := range r.Prs {
+		mis = append(mis, r.Prs[id].Match)
+	}
+	// 逆序排列
+	sort.Sort(sort.Reverse(mis))
+	// 排列之后拿到中位数的Match，因为如果这个位置的Match对应的Term也等于当前的Term
+	// 说明有过半的节点至少comit了mci这个索引的数据，这样leader就可以以这个索引进行commit了
+	mci := mis[r.quorum()-1]
+	// raft日志尝试commit
+	return r.RaftLog.maybeCommit(mci, r.Term)
+}
+
+// 收到appresp的成功应答之后，leader更新节点的索引数据
+// 如果传入的n小于等于当前的match索引，则索引就不会更新，返回false；否则更新索引返回true
+func (pr *Progress) maybeUpdate(n uint64) bool {
+	var updated bool
+	if pr.Match < n {
+		pr.Match = n
+		updated = true
+	}
+	if pr.Next < n+1 {
+		pr.Next = n + 1
+	}
+	return updated
+}
+
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	// 如果发过来的消息索引小于当前commit索引，就返回当前commit索引
+	if m.Term >= r.Term {
+		r.Term = m.Term
+	} else {
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Term: r.Term, Reject: true}
+		r.msgs = append(r.msgs, msg)
+		return
+	}
+	if m.Index < r.RaftLog.committed {
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed, Term: r.Term}
+		r.msgs = append(r.msgs, msg)
+		return
+	}
+
+	entry := []pb.Entry{}
+	if len(m.Entries) != 0 {
+		for _, ent := range m.Entries {
+			entry = append(entry, *ent)
+		}
+	}
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, entry...); ok {
+		// 添加日志成功，应答当前的最后索引回去
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: mlastIndex, Term: r.Term}
+		r.msgs = append(r.msgs, msg)
+		log.Printf("[%d] after Append commited is %d, LastIndex is %d\n", r.id, r.RaftLog.committed, mlastIndex)
+	} else {
+		// 添加日志失败
+		term, _ := r.RaftLog.Term(m.Index)
+		log.Printf("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
+			r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
+		r.msgs = append(r.msgs, msg)
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
