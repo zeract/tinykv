@@ -153,6 +153,31 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 	}
 }
 
+// 将raftlog的applied修改为i
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	// 判断合法性
+	// 新的applied ID既不能比committed大，也不能比当前的applied索引小
+	if l.committed < i || i < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	log.Printf("applied to %d, entries size: %d\n", i, len(l.entries))
+	l.applied = i
+}
+
+func (l *RaftLog) stableTo(i, t uint64) {
+	gt, _ := l.Term(i)
+	if i > l.LastIndex() {
+		return
+	}
+	if gt == t && i >= l.stabled {
+		log.Printf("stable to %d, entries size: %d\n", i, len(l.entries))
+		l.stabled = i
+	}
+}
+
 // 尝试去commit
 func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
 	// 只有在传入的index大于当前commit索引，以及maxIndex对应的term与传入的term匹配时，才使用这些数据进行commit
@@ -215,4 +240,19 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 		}
 	}
 	return 0
+}
+
+func (l *RaftLog) firstIndex() uint64 {
+
+	// 返回持久化数据的firsttIndex
+	index, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	return index
+}
+
+func (l *RaftLog) hasNextEnts() bool {
+	off := max(l.applied+1, l.firstIndex())
+	return l.committed+1 > off
 }

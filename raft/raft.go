@@ -193,6 +193,9 @@ func newRaft(c *Config) *Raft {
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
 	}
+	if c.Applied > 0 {
+		log.appliedTo(c.Applied)
+	}
 	return &raft
 }
 
@@ -342,6 +345,7 @@ func (r *Raft) becomeLeader() {
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.entries = append(r.RaftLog.entries, entry)
 	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+	r.maybeCommit()
 	for id := range r.Prs {
 		if id != r.id {
 			r.sendNoopEntry(id)
@@ -692,4 +696,14 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }
