@@ -32,6 +32,7 @@ func newRouter(storeSender chan<- message.Msg) *router {
 	return pm
 }
 
+// 根据regionID得到对应的peerState
 func (pr *router) get(regionID uint64) *peerState {
 	v, ok := pr.peers.Load(regionID)
 	if ok {
@@ -40,6 +41,7 @@ func (pr *router) get(regionID uint64) *peerState {
 	return nil
 }
 
+// 将给定的peer存储router中
 func (pr *router) register(peer *peer) {
 	id := peer.regionId
 	newPeer := &peerState{
@@ -48,6 +50,7 @@ func (pr *router) register(peer *peer) {
 	pr.peers.Store(id, newPeer)
 }
 
+// 从router中删除给定的peer
 func (pr *router) close(regionID uint64) {
 	v, ok := pr.peers.Load(regionID)
 	if ok {
@@ -57,6 +60,7 @@ func (pr *router) close(regionID uint64) {
 	}
 }
 
+// 通过router向regionID的peer发送msg
 func (pr *router) send(regionID uint64, msg message.Msg) error {
 	msg.RegionID = regionID
 	p := pr.get(regionID)
@@ -67,6 +71,7 @@ func (pr *router) send(regionID uint64, msg message.Msg) error {
 	return nil
 }
 
+// router接收msg
 func (pr *router) sendStore(msg message.Msg) {
 	pr.storeSender <- msg
 }
@@ -85,6 +90,7 @@ func (r *RaftstoreRouter) Send(regionID uint64, msg message.Msg) error {
 	return r.router.send(regionID, msg)
 }
 
+// 发送Raft消息，如果发送的peer不在router中，则将消息存储在router中
 func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error {
 	regionID := msg.RegionId
 	if r.router.send(regionID, message.NewPeerMsg(message.MsgTypeRaftMessage, regionID, msg)) != nil {
@@ -94,6 +100,7 @@ func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error 
 
 }
 
+// 发送RaftCmd消息
 func (r *RaftstoreRouter) SendRaftCommand(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) error {
 	cmd := &message.MsgRaftCmd{
 		Request:  req,

@@ -104,8 +104,8 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey
@@ -133,6 +133,7 @@ func (bs *Raftstore) loadPeers() ([]*peer, error) {
 			if err != nil {
 				return err
 			}
+			// 只需要RegionState
 			if suffix != meta.RegionStateSuffix {
 				continue
 			}
@@ -147,6 +148,7 @@ func (bs *Raftstore) loadPeers() ([]*peer, error) {
 				return errors.WithStack(err)
 			}
 			region := localState.Region
+			// 如果region的state是Tombstone，则需要清理过时的元数据
 			if localState.State == rspb.PeerState_Tombstone {
 				tombStoneCount++
 				bs.clearStaleMeta(kvWB, raftWB, localState)
