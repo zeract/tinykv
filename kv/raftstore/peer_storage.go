@@ -309,15 +309,26 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	// append the entries
-	for _, entry := range entries {
-		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	if len(entries) != 0 {
+		for _, entry := range entries {
+			err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+			if err != nil {
+				return err
+			}
+			// log.Infof("Append Entry with index %d", entry.Index)
+		}
+		state := ps.raftState
+		state.LastIndex = entries[len(entries)-1].Index
+		state.LastTerm = entries[len(entries)-1].Term
+		state.HardState.Term = state.LastTerm
+		ps.raftState = state
+		prevLastIndex, _ := ps.LastIndex()
+		for i := state.LastIndex + 1; i <= prevLastIndex; i++ {
+			key := meta.RaftLogKey(ps.region.Id, i)
+			raftWB.DeleteMeta(key)
+		}
+		raftWB.MustWriteToDB(ps.Engines.Raft)
 	}
-	state := ps.raftState
-	state.LastIndex = entries[len(entries)-1].Index
-	state.LastTerm = entries[len(entries)-1].Term
-	state.HardState.Term = state.LastTerm
-	ps.raftState = state
-	raftWB.MustWriteToDB(ps.Engines.Raft)
 
 	return nil
 }
