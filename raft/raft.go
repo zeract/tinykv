@@ -222,24 +222,45 @@ func (r *Raft) loadState(state pb.HardState) {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	entry := []*pb.Entry{}
-	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgAppend}
+	msg := pb.Message{From: r.id, To: to, Term: r.Term}
 	// 将entry[Next:]发送给peer
 	pr := r.Prs[to]
+	term, errt := r.RaftLog.Term(pr.Next - 1)
 	// log.Infof("[%d] Send Append RPC Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
-	ents, _ := r.RaftLog.Entries(pr.Next)
-	// log.Infof("Send append entries is %v", ents)
-	for _, e := range ents {
-		entry = append(entry, &pb.Entry{
-			Index: e.Index,
-			Term:  e.Term,
-			Data:  e.Data,
-		})
+	ents, erre := r.RaftLog.Entries(pr.Next)
+	if errt != nil || erre != nil {
+		msg.MsgType = pb.MessageType_MsgSnapshot
+		snap, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			log.Panic(err)
+		}
+		// 判断发送快照是否为空
+		if IsEmptySnap(&snap) {
+			log.Panicf("Need non-empty snapshot")
+		}
+		msg.Snapshot = &snap
+
+	} else {
+		// 可以正确取到term和entries
+		// log.Infof("Send append entries is %v", ents)
+		for _, e := range ents {
+			entry = append(entry, &pb.Entry{
+				Index: e.Index,
+				Term:  e.Term,
+				Data:  e.Data,
+			})
+		}
+		msg.MsgType = pb.MessageType_MsgAppend
+		msg.Entries = entry
+		msg.Index = r.Prs[to].Next - 1
+		msg.LogTerm = term
+		msg.Commit = r.RaftLog.committed
+		// log.Printf("The Append entry is %v\n", entry[0])
 	}
-	msg.Entries = entry
-	msg.Index = r.Prs[to].Next - 1
-	msg.LogTerm, _ = r.RaftLog.Term(msg.Index)
-	msg.Commit = r.RaftLog.committed
-	// log.Printf("The Append entry is %v\n", entry[0])
 
 	r.msgs = append(r.msgs, msg)
 	return true
@@ -452,6 +473,11 @@ func (r *Raft) Step(m pb.Message) error {
 			r.electionElapsed = 0
 			r.Lead = m.From
 			r.handleHeartbeat(m)
+		case pb.MessageType_MsgSnapshot:
+			// 处理snapshot消息
+			r.Lead = m.From
+			r.electionElapsed = 0
+			r.handleSnapshot(m)
 		}
 
 	case StateCandidate:
@@ -513,16 +539,16 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 			}
 		case pb.MessageType_MsgAppend:
-			{
-				if m.Term >= r.Term {
-					r.becomeFollower(m.Term, m.From)
-				}
+			if m.Term >= r.Term {
+				r.becomeFollower(m.Term, m.From)
 			}
 		case pb.MessageType_MsgHeartbeat:
-			{
-				r.becomeFollower(m.Term, m.From)
-				r.handleHeartbeat(m)
-			}
+			r.becomeFollower(m.Term, m.From)
+			r.handleHeartbeat(m)
+		case pb.MessageType_MsgSnapshot:
+			// 处理snapshot消息
+			r.becomeFollower(m.Term, m.From)
+			r.handleSnapshot(m)
 		}
 
 	case StateLeader:
@@ -710,6 +736,44 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	// sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if r.snapRestore(*m.Snapshot) {
+		// log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()}
+		r.msgs = append(r.msgs, msg)
+
+	} else {
+		// log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed}
+		r.msgs = append(r.msgs, msg)
+	}
+}
+
+func (r *Raft) snapRestore(snap pb.Snapshot) bool {
+	if snap.Metadata.Index <= r.RaftLog.committed {
+		return false
+	}
+	term, _ := r.RaftLog.Term(snap.Metadata.Index)
+	// Term匹配说明raftlog中已经存在对应的日志
+	if term == snap.Metadata.Term {
+		r.RaftLog.commitTo(snap.Metadata.Index)
+		return false
+	}
+	r.RaftLog.snapRestore(snap)
+	r.Prs = make(map[uint64]*Progress)
+	// 对集群中其他节点的状态也使用快照中的状态数据进行恢复
+	for _, n := range snap.Metadata.ConfState.Nodes {
+		match, next := uint64(0), r.RaftLog.LastIndex()+1
+		if n == r.id {
+			match = next - 1
+		}
+		r.Prs[n].Match = match
+		r.Prs[n].Next = next
+		// log.Infof("%x restored progress of %x [%s]", r.id, n, r.Prs[n])
+	}
+	return true
 }
 
 // addNode add a new node to raft group

@@ -138,7 +138,10 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.unstableEntries()) != 0 {
 		return l.stabled + uint64(len(l.unstableEntries()))
 	}
-
+	// 2C 如果存在snapshot，则返回snapshot的索引
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
 	i, err := l.storage.LastIndex()
 	if err != nil {
 		panic(err)
@@ -287,7 +290,10 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 }
 
 func (l *RaftLog) firstIndex() uint64 {
-
+	// 如果存在snapshot则返回快照中的数据
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
 	// 返回持久化数据的firsttIndex
 	index, err := l.storage.FirstIndex()
 	if err != nil {
@@ -386,4 +392,20 @@ func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
 		log.Panicf("slice[%d,%d) out of bound [%d,%d]", lo, hi, fi, l.LastIndex())
 	}
 	return nil
+}
+
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+	return l.storage.Snapshot()
+}
+
+// 从Snapshot中恢复数据
+func (l *RaftLog) snapRestore(snap pb.Snapshot) {
+	l.committed = snap.Metadata.Index
+	l.dummyIndex = snap.Metadata.Index
+	l.stabled = snap.Metadata.Index
+	l.entries = l.entries[:l.stabled-l.dummyIndex]
+	l.pendingSnapshot = &snap
 }
