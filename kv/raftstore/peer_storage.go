@@ -345,7 +345,54 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if ps.isInitialized() {
+		// 清除stale的数据
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	ps.raftState = &rspb.RaftLocalState{
+		HardState: &eraftpb.HardState{
+			Term:   snapshot.Metadata.Term,
+			Vote:   ps.raftState.HardState.Vote,
+			Commit: snapshot.Metadata.Index,
+		},
+		LastIndex: snapshot.Metadata.Index,
+		LastTerm:  snapshot.Metadata.Term,
+	}
+	ps.applyState = &rspb.RaftApplyState{
+		AppliedIndex: snapshot.Metadata.Index,
+		TruncatedState: &rspb.RaftTruncatedState{
+			Index: snapshot.Metadata.Index,
+			Term:  snapshot.Metadata.Term,
+		},
+	}
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	<-ch
+
+	return &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.
@@ -354,9 +401,17 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	var snap *ApplySnapResult
+	var err error
 	snap = nil
 	if !raft.IsEmptySnap(&ready.Snapshot) {
-		snap, _ = ps.ApplySnapshot(&ready.Snapshot, &engine_util.WriteBatch{}, &engine_util.WriteBatch{})
+		kvWb := &engine_util.WriteBatch{}
+		raftWb := &engine_util.WriteBatch{}
+		snap, err = ps.ApplySnapshot(&ready.Snapshot, kvWb, raftWb)
+		if err != nil {
+			return nil, err
+		}
+		ps.Engines.WriteKV(kvWb)
+		ps.Engines.WriteRaft(raftWb)
 	}
 	ps.Append(ready.Entries, &engine_util.WriteBatch{})
 

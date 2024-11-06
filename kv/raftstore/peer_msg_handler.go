@@ -57,71 +57,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			for _, entry := range ready.CommittedEntries {
 				// 遍历所有的committed Entries，如果是Normal request则继续进行处理
 				if entry.EntryType == eraftpb.EntryType_EntryNormal {
-					p := d.FindProposal(entry.Index, entry.Term)
 					// 从Entry中取出对应的RaftCmdRequest，其中包含多个Requests
 					requests := new(raft_cmdpb.RaftCmdRequest)
 					requests.Unmarshal(entry.Data)
 					// 创建这个RaftCmdRequest对应的WriteBatch
 					wb := &engine_util.WriteBatch{}
-					resp := &raft_cmdpb.RaftCmdResponse{
-						Header:    &raft_cmdpb.RaftResponseHeader{},
-						Responses: []*raft_cmdpb.Response{},
-					}
-					for _, request := range requests.Requests {
-						if request.GetCmdType() != raft_cmdpb.CmdType_Invalid {
-							t := request.GetCmdType()
-							// 判断是读请求还是写请求
-							if t == raft_cmdpb.CmdType_Delete || t == raft_cmdpb.CmdType_Put {
-								if t == raft_cmdpb.CmdType_Delete {
-									// Delete Request，需要执行Delete操作
-									cf := request.GetDelete().GetCf()
-									key := request.GetDelete().GetKey()
-									wb.DeleteCF(cf, key)
-									// 构造一个空的Delete Response请求
-									resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete,
-										Delete: &raft_cmdpb.DeleteResponse{}})
-								} else {
-									// Put Request，需要执行Put操作
-									cf := request.GetPut().GetCf()
-									key := request.GetPut().GetKey()
-									wb.SetCF(cf, key, request.Put.Value)
-									// 构造一个空的Put Response请求
-									resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put,
-										Put: &raft_cmdpb.PutResponse{}})
-								}
-
-							} else {
-								// 读取请求
-								if t == raft_cmdpb.CmdType_Get {
-									// Get Request, 需要执行Get操作
-									cf := request.GetGet().GetCf()
-									key := request.GetGet().GetKey()
-									val, err := engine_util.GetCF(d.ctx.engine.Kv, cf, key)
-									if err != nil {
-										if p != nil {
-											p.cb.Done(ErrResp(err))
-										}
-										return
-									}
-									resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get,
-										Get: &raft_cmdpb.GetResponse{Value: val}})
-								} else {
-									// Snap Request, 需要执行Snap操作
-									resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap,
-										Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
-									if p != nil {
-										// 设置一个新的Transaction供来读
-										p.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
-									}
-								}
-							}
-
-						} else {
-							log.Panicf("The Request is Nil!")
-						}
-					}
-					if p != nil {
-						p.cb.Done(resp)
+					if len(requests.Requests) != 0 {
+						// 将requests中的数据进行apply
+						d.applyNormalRequests(requests, entry, wb)
+					} else {
+						d.applySnapshotRequests(requests, entry, wb)
 					}
 					// 更新PeerStorage的AppliedIndex
 					d.peerStorage.applyState.AppliedIndex = entry.Index
@@ -140,6 +85,87 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		d.RaftGroup.Advance(ready)
 	}
 
+}
+
+func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+	p := d.FindProposal(entry.Index, entry.Term)
+	// 创建这个RaftCmdRequest对应的WriteBatch
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: []*raft_cmdpb.Response{},
+	}
+	for _, request := range requests.Requests {
+		if request.GetCmdType() != raft_cmdpb.CmdType_Invalid {
+			t := request.GetCmdType()
+			// 判断是读请求还是写请求
+			if t == raft_cmdpb.CmdType_Delete || t == raft_cmdpb.CmdType_Put {
+				if t == raft_cmdpb.CmdType_Delete {
+					// Delete Request，需要执行Delete操作
+					cf := request.GetDelete().GetCf()
+					key := request.GetDelete().GetKey()
+					wb.DeleteCF(cf, key)
+					// 构造一个空的Delete Response请求
+					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete,
+						Delete: &raft_cmdpb.DeleteResponse{}})
+				} else {
+					// Put Request，需要执行Put操作
+					cf := request.GetPut().GetCf()
+					key := request.GetPut().GetKey()
+					wb.SetCF(cf, key, request.Put.Value)
+					// 构造一个空的Put Response请求
+					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put,
+						Put: &raft_cmdpb.PutResponse{}})
+				}
+
+			} else {
+				// 读取请求
+				if t == raft_cmdpb.CmdType_Get {
+					// Get Request, 需要执行Get操作
+					cf := request.GetGet().GetCf()
+					key := request.GetGet().GetKey()
+					val, err := engine_util.GetCF(d.ctx.engine.Kv, cf, key)
+					if err != nil {
+						if p != nil {
+							p.cb.Done(ErrResp(err))
+						}
+						return
+					}
+					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get,
+						Get: &raft_cmdpb.GetResponse{Value: val}})
+				} else {
+					// Snap Request, 需要执行Snap操作
+					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap,
+						Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
+					if p != nil {
+						// 设置一个新的Transaction供来读
+						p.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+					}
+				}
+			}
+
+		} else {
+			log.Panicf("The Request is Nil!")
+		}
+	}
+	if p != nil {
+		p.cb.Done(resp)
+	}
+}
+
+func (d *peerMsgHandler) applySnapshotRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+	switch requests.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compact := requests.AdminRequest.CompactLog
+		if compact.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+			d.peerStorage.applyState.TruncatedState.Index = compact.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = compact.CompactTerm
+			err := wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				log.Panic(err)
+			}
+			d.ScheduleCompactLog(compact.CompactIndex)
+		}
+	}
 }
 
 // 在peerMsgHandler中寻找对应的proposal请求
@@ -234,11 +260,13 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	d.proposals = append(d.proposals, &proposal{
-		index: d.nextProposalIndex(),
-		term:  d.Term(),
-		cb:    cb,
-	})
+	if len(msg.Requests) != 0 {
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		})
+	}
 	data, _ := msg.Marshal()
 	d.RaftGroup.Propose(data)
 }

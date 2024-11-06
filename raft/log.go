@@ -92,6 +92,13 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	truncated, _ := l.storage.FirstIndex()
+	if len(l.entries) > 0 {
+		index := l.entries[0].Index
+		if truncated > index {
+			l.entries = l.entries[truncated-index:]
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -408,4 +415,11 @@ func (l *RaftLog) snapRestore(snap pb.Snapshot) {
 	l.stabled = snap.Metadata.Index
 	l.entries = l.entries[:l.stabled-l.dummyIndex]
 	l.pendingSnapshot = &snap
+}
+
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		// 传入索引刚好是快照的索引，说明快照已经保存，当前快照可以置空
+		l.pendingSnapshot = nil
+	}
 }
