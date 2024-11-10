@@ -127,7 +127,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	// log.Printf("The Applied index is %d, Commited index is %d\n", l.applied, l.committed)
+	// log.Infof("The Applied index is %d, Commited index is %d\n", l.applied, l.committed)
 	start := max(l.applied+1, l.firstIndex())
 	if l.committed+1 > start {
 		ents, err := l.slice(start, l.committed+1)
@@ -317,16 +317,41 @@ func (l *RaftLog) hasNextEnts() bool {
 func (l *RaftLog) maybeunstableTerm(i uint64) (uint64, bool) {
 	// log.Infof("Try to get unstable Term, the index is %d, stable index is %d, lastindex is %d", i, l.stabled, l.LastIndex())
 	if i <= l.stabled {
+		if l.pendingSnapshot == nil {
+			return 0, false
+		}
+		if l.pendingSnapshot.Metadata.Index == i {
+			// log.Infof("Try to get unstable Term, Get Term from snapShot, Term is %d", l.pendingSnapshot.Metadata.Term)
+			return l.pendingSnapshot.Metadata.Term, true
+		}
 		return 0, false
 	}
 
-	last := l.LastIndex()
-	if i > last || i == 0 {
+	if i <= l.stabled {
+		return 0, false
+	}
+
+	last, ok := l.mayLastIndex()
+	if !ok {
+		return 0, false
+	}
+	if i > last {
 		return 0, false
 	}
 	// 使用unstable entry来获取term
 	unstable := l.unstableEntries()
 	return unstable[i-l.stabled-1].Term, true
+}
+
+func (l *RaftLog) mayLastIndex() (uint64, bool) {
+	unstable := l.unstableEntries()
+	if length := len(unstable); length != 0 {
+		return l.stabled + uint64(length), true
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index, true
+	}
+	return 0, false
 }
 
 // 获取从i开始的entries返回
@@ -413,13 +438,18 @@ func (l *RaftLog) snapRestore(snap pb.Snapshot) {
 	l.committed = snap.Metadata.Index
 	l.dummyIndex = snap.Metadata.Index
 	l.stabled = snap.Metadata.Index
-	l.entries = l.entries[:l.stabled-l.dummyIndex]
+	// l.entries = l.entries[:l.stabled-l.dummyIndex]
+	l.entries = nil
 	l.pendingSnapshot = &snap
 }
 
 func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil {
+		log.Infof("Ready snap index is %d, PendingSnapshot is %d", i, l.pendingSnapshot.Metadata.Index)
+	}
 	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
 		// 传入索引刚好是快照的索引，说明快照已经保存，当前快照可以置空
+		log.Infof("Stable Snap to %d, now Snap is nil", i)
 		l.pendingSnapshot = nil
 	}
 }

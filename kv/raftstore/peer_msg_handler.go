@@ -62,11 +62,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					requests.Unmarshal(entry.Data)
 					// 创建这个RaftCmdRequest对应的WriteBatch
 					wb := &engine_util.WriteBatch{}
-					if len(requests.Requests) != 0 {
+					if requests.AdminRequest != nil {
+						d.applySnapshotRequests(requests, entry, wb)
+					} else {
 						// 将requests中的数据进行apply
 						d.applyNormalRequests(requests, entry, wb)
-					} else {
-						d.applySnapshotRequests(requests, entry, wb)
 					}
 					// 更新PeerStorage的AppliedIndex
 					d.peerStorage.applyState.AppliedIndex = entry.Index
@@ -260,7 +260,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	if len(msg.Requests) != 0 {
+	if msg.AdminRequest == nil {
 		d.proposals = append(d.proposals, &proposal{
 			index: d.nextProposalIndex(),
 			term:  d.Term(),

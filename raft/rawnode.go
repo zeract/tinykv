@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -197,7 +198,10 @@ func newReady(raft *Raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready 
 	if isHardStateEqual(rd.HardState, prevHardSt) {
 		rd.HardState = pb.HardState{}
 	}
-
+	// 如果raft的snap不为空，传递给ready
+	if raft.RaftLog.pendingSnapshot != nil && !IsEmptySnap(raft.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *raft.RaftLog.pendingSnapshot
+	}
 	return rd
 }
 
@@ -219,6 +223,7 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 	if r.RaftLog.pendingSnapshot != nil && !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		// log.Infof("Snapshot is not empty, Has Ready data")
 		return true
 	}
 	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || r.RaftLog.hasNextEnts() {
@@ -232,6 +237,7 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+
 	if rd.SoftState != nil {
 		rn.prevSoftSt = rd.SoftState
 	}
@@ -246,6 +252,7 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.stableTo(e.Index, e.Term)
 	}
 	if !IsEmptySnap(&rd.Snapshot) {
+		log.Infof("Call Advance, Snap is not empty")
 		rn.Raft.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
 		rn.Raft.RaftLog.maybeCompact()
 	}

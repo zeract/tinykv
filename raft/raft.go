@@ -243,6 +243,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			log.Panicf("Need non-empty snapshot")
 		}
 		msg.Snapshot = &snap
+		log.Infof("Send Snapshot[%d,%d] from %d to %d", snap.Metadata.Index, snap.Metadata.Term, r.id, to)
 
 	} else {
 		// 可以正确取到term和entries
@@ -447,7 +448,8 @@ func (r *Raft) Step(m pb.Message) error {
 				r.becomeLeader()
 				for id := range r.Prs {
 					if id != r.id {
-						r.sendNoopEntry(id)
+						// r.sendNoopEntry(id)
+						r.sendAppend(id)
 					}
 				}
 			} else {
@@ -490,7 +492,8 @@ func (r *Raft) Step(m pb.Message) error {
 				r.becomeLeader()
 				for id := range r.Prs {
 					if id != r.id {
-						r.sendNoopEntry(id)
+						// r.sendNoopEntry(id)
+						r.sendAppend(id)
 					}
 				}
 			} else {
@@ -521,7 +524,8 @@ func (r *Raft) Step(m pb.Message) error {
 					r.becomeLeader()
 					for id := range r.Prs {
 						if id != r.id {
-							r.sendNoopEntry(id)
+							// r.sendNoopEntry(id)
+							r.sendAppend(id)
 						}
 					}
 				}
@@ -736,16 +740,16 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-	// sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.snapRestore(*m.Snapshot) {
-		// log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
-		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()}
 		r.msgs = append(r.msgs, msg)
 
 	} else {
-		// log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
-		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed}
 		r.msgs = append(r.msgs, msg)
 	}
@@ -769,8 +773,10 @@ func (r *Raft) snapRestore(snap pb.Snapshot) bool {
 		if n == r.id {
 			match = next - 1
 		}
-		r.Prs[n].Match = match
-		r.Prs[n].Next = next
+		r.Prs[n] = &Progress{
+			Match: match,
+			Next:  next,
+		}
 		// log.Infof("%x restored progress of %x [%s]", r.id, n, r.Prs[n])
 	}
 	return true
