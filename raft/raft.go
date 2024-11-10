@@ -608,24 +608,7 @@ func (r *Raft) Step(m pb.Message) error {
 					pr.Next = 1
 					log.Panicf("Retry Append Error!\n")
 				}
-				entry := []*pb.Entry{}
-				msg := pb.Message{From: r.id, To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgAppend}
-				ents, err := r.RaftLog.Entries(pr.Next)
-				if err != nil {
-					log.Panicf("Append fail: Get Entries fail!")
-				}
-				for _, e := range ents {
-					entry = append(entry, &pb.Entry{
-						Index: e.Index,
-						Term:  e.Term,
-						Data:  e.Data,
-					})
-				}
-				msg.Entries = entry
-				msg.Index = pr.Next - 1
-				msg.LogTerm, _ = r.RaftLog.Term(msg.Index)
-				msg.Commit = r.RaftLog.committed
-				r.msgs = append(r.msgs, msg)
+				r.sendAppend(m.From)
 				// log.Infof("[%d] retry to append [logterm: %d, index: %d] to [%d]\n", r.id, msg.LogTerm, msg.Index, m.From)
 			}
 		case pb.MessageType_MsgHeartbeatResponse:
