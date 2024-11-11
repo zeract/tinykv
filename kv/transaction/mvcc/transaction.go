@@ -101,6 +101,7 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	iter.Seek(EncodeKey(key, txn.StartTS))
 	k := iter.Item().Key()
+	defer iter.Close()
 	// 如果找到的key为nil，直接返回
 	if k == nil {
 		return nil, nil
@@ -159,6 +160,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	iter.Seek(EncodeKey(key, TsMax))
 	value, _ := iter.Item().Value()
+	defer iter.Close()
 	// 如果没有write记录，直接返回
 	if value == nil {
 		return nil, 0, nil
@@ -196,6 +198,7 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	iter.Seek(EncodeKey(key, TsMax))
 	k := iter.Item().Key()
+	defer iter.Close()
 	if k == nil {
 		return nil, 0, nil
 	}
