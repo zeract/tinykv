@@ -79,6 +79,32 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						d.peerStorage.Engines.WriteKV(WB)
 						return
 					}
+				} else {
+					// ConfChange请求
+					region := d.Region()
+					conf := new(eraftpb.ConfChange)
+					conf.Unmarshal(entry.Data)
+					peer := region.GetPeers()
+					if conf.ChangeType == eraftpb.ConfChangeType_AddNode {
+						peer[conf.NodeId] = &metapb.Peer{}
+					} else {
+						if conf.NodeId == d.PeerId() {
+							d.destroyPeer()
+							return
+						}
+						util.RemovePeer(region, peer[conf.NodeId].StoreId)
+					}
+					region.RegionEpoch.ConfVer++
+					kv := &engine_util.WriteBatch{}
+					kv.SetMeta(meta.ApplyStateKey(d.regionId), region)
+					meta.WriteRegionState(kv, region, rspb.PeerState_Normal)
+					if conf.ChangeType == eraftpb.ConfChangeType_AddNode {
+						d.insertPeerCache(peer[conf.NodeId])
+					} else {
+						d.removePeerCache(conf.NodeId)
+					}
+					d.RaftGroup.ApplyConfChange(*conf)
+					d.notifyHeartbeatScheduler(region, d.peer)
 				}
 			}
 		}
@@ -86,7 +112,19 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 }
-
+func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *peer) {
+	clonedRegion := new(metapb.Region)
+	err := util.CloneMsg(region, clonedRegion)
+	if err != nil {
+		return
+	}
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
+	}
+}
 func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) {
 	p := d.FindProposal(entry.Index, entry.Term)
 	// 创建这个RaftCmdRequest对应的WriteBatch

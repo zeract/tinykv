@@ -438,6 +438,7 @@ func (l *RaftLog) snapRestore(snap pb.Snapshot) {
 	l.committed = snap.Metadata.Index
 	l.dummyIndex = snap.Metadata.Index
 	l.stabled = snap.Metadata.Index
+	l.applied = snap.Metadata.Index
 	// l.entries = l.entries[:l.stabled-l.dummyIndex]
 	l.entries = nil
 	l.pendingSnapshot = &snap

@@ -309,6 +309,9 @@ func (r *Raft) tick() {
 		//r.msgs = append(r.msgs, msg)
 		r.electionElapsed = 0
 		r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+		if r.State == StateLeader && r.leadTransferee != None {
+			r.leadTransferee = None
+		}
 		r.Step(msg)
 
 	}
@@ -337,6 +340,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// increment the term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.PendingConfIndex = 0
+	r.leadTransferee = None
 	if r.Term != term {
 		r.Term = term
 		r.Vote = None
@@ -360,6 +365,8 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.PendingConfIndex = 0
+	r.leadTransferee = None
 	for id := range r.Prs {
 		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 		if id == r.id {
@@ -375,11 +382,24 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.State = StateLeader
 	r.Lead = r.id
+	r.PendingConfIndex = 0
+	r.leadTransferee = None
 	for id := range r.Prs {
 		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 		if id == r.id {
 			r.Prs[id].Match = r.RaftLog.LastIndex()
 		}
+	}
+	ents, err := r.RaftLog.Entries(r.RaftLog.committed + 1)
+	if err != nil {
+		log.Panic(err)
+	}
+	nconf := numOfPendingConf(ents)
+	if nconf > 1 {
+		panic("unexpected multiple uncommitted config entry")
+	}
+	if nconf == 1 {
+		r.PendingConfIndex = r.RaftLog.LastIndex()
 	}
 	// Leader propose a noop entry
 	// log.Infof("[%d] become Leader\n", r.id)
@@ -441,6 +461,13 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		// start new election
 		case pb.MessageType_MsgHup:
+			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
+			if err != nil {
+				log.Panic(err)
+			}
+			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+				return nil
+			}
 			r.becomeCandidate()
 			// Candidate vote for self
 			r.votes[r.id] = true
@@ -480,11 +507,34 @@ func (r *Raft) Step(m pb.Message) error {
 			r.Lead = m.From
 			r.electionElapsed = 0
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			// 当前节点必须在集群中
+			if _, ok := r.Prs[r.id]; ok {
+				// 向自己发送msgHup请求
+				msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
+				// MsgHup是一个local message，不能添加到r.msgs中
+				r.Step(msg)
+			}
+
+		case pb.MessageType_MsgTransferLeader:
+			if r.Lead == None {
+				// 还没有选出leader,直接返回
+				return nil
+			}
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
 		}
 
 	case StateCandidate:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
+			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
+			if err != nil {
+				log.Panic(err)
+			}
+			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+				return nil
+			}
 			r.becomeCandidate()
 			// Candidate vote for self
 			r.votes[r.id] = true
@@ -573,8 +623,31 @@ func (r *Raft) Step(m pb.Message) error {
 
 		case pb.MessageType_MsgPropose:
 			// log.Infof("Receive Propose signal!\n")
-			entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
-			r.RaftLog.append(entry)
+			if _, ok := r.Prs[r.id]; !ok {
+				// 节点被移除集群
+				return nil
+			}
+			if r.leadTransferee != None {
+				// 在转换leader的过程中，不能提交
+				return nil
+			}
+			for i, e := range m.Entries {
+				if e.EntryType == pb.EntryType_EntryConfChange {
+					if r.PendingConfIndex > r.RaftLog.applied {
+						m.Entries[i] = &pb.Entry{EntryType: pb.EntryType_EntryNormal}
+					}
+					r.PendingConfIndex = r.RaftLog.LastIndex()
+				}
+			}
+			var entries []pb.Entry
+			last := r.RaftLog.LastIndex()
+			for i := range m.Entries {
+				m.Entries[i].Term = r.Term
+				m.Entries[i].Index = last + 1 + uint64(i)
+				entries = append(entries, *m.Entries[i])
+			}
+			// entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
+			r.RaftLog.append(entries...)
 			// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
 			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 			r.maybeCommit()
@@ -588,15 +661,22 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgAppendResponse:
 			if !m.Reject {
 				pr := r.Prs[m.From]
-				pr.maybeUpdate(m.Index)
-				if r.maybeCommit() {
-					// 更新follower的commited
-					for id := range r.Prs {
-						if id != r.id {
-							r.sendAppend(id)
+				if pr.maybeUpdate(m.Index) {
+					if r.maybeCommit() {
+						// 更新follower的commited
+						for id := range r.Prs {
+							if id != r.id {
+								r.sendAppend(id)
+							}
 						}
 					}
+					if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
+						// 发送TimeoutNow消息
+						msg := pb.Message{To: m.From, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
+						r.msgs = append(r.msgs, msg)
+					}
 				}
+
 			} else {
 				// append失败的index,减1继续发送append请求
 				pr := r.Prs[m.From]
@@ -616,6 +696,35 @@ func (r *Raft) Step(m pb.Message) error {
 			// 如果follower的Match index小于Leader的lastindex，就向follower发送append请求
 			if pr.Match < r.RaftLog.LastIndex() {
 				r.sendAppend(m.From)
+			}
+		case pb.MessageType_MsgTransferLeader:
+			leadTransferee := m.From
+			lastLeadTransferee := r.leadTransferee
+			if lastLeadTransferee != None {
+				if lastLeadTransferee == leadTransferee {
+					// 已经有相同节点的leader转让流程在进行中
+					return nil
+				}
+				// 中断之前的转让流程
+				r.leadTransferee = None
+			}
+			if leadTransferee == r.id {
+				return nil
+			}
+
+			r.electionElapsed = 0
+			r.leadTransferee = leadTransferee
+			pr, ok := r.Prs[m.From]
+			if !ok {
+				log.Infof("%x no progress available for %x", r.id, m.From)
+				return nil
+			}
+			if pr.Match == r.RaftLog.LastIndex() {
+				// 发送TimeoutNow消息
+				msg := pb.Message{To: leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
+				r.msgs = append(r.msgs, msg)
+			} else {
+				r.sendAppend(leadTransferee)
 			}
 		}
 	}
@@ -768,11 +877,37 @@ func (r *Raft) snapRestore(snap pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.PendingConfIndex = 0
+	if _, ok := r.Prs[id]; ok {
+		// 已经在节点列表中
+		return
+	}
+	r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+	// 重置PendingConfIndex
+	r.PendingConfIndex = 0
+
+	if len(r.Prs) == 0 {
+		return
+	}
+	// 删除节点后，可能可以进行commit操作
+	if r.maybeCommit() {
+		for id := range r.Prs {
+			if id != r.id {
+				r.sendAppend(id)
+			}
+		}
+	}
+	// 如果在leader迁移过程中发生删除节点操作，就中断迁移流程
+	if r.State == StateLeader && r.leadTransferee != None {
+		r.leadTransferee = None
+	}
 }
 
 func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
@@ -783,4 +918,13 @@ func (r *Raft) hardState() pb.HardState {
 		Vote:   r.Vote,
 		Commit: r.RaftLog.committed,
 	}
+}
+func numOfPendingConf(ents []pb.Entry) int {
+	n := 0
+	for i := range ents {
+		if ents[i].EntryType == pb.EntryType_EntryConfChange {
+			n++
+		}
+	}
+	return n
 }
