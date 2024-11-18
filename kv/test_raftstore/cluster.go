@@ -420,7 +420,9 @@ func (c *Cluster) MustTransferLeader(regionID uint64, leader *metapb.Peer) {
 		if time.Since(timer) > 5*time.Second {
 			panic(fmt.Sprintf("failed to transfer leader to [%d] %s", regionID, leader.String()))
 		}
+		// log.Infof("Before Transfer Leader, Leader Id is %d, Want Leader id is %d", currentLeader.Id, leader.Id)
 		c.TransferLeader(regionID, leader)
+		// log.Infof("After Transfer Leader, Leader Id is %d", c.LeaderOfRegion(regionID).Id)
 	}
 }
 

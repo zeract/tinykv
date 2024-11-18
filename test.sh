@@ -10,7 +10,7 @@ do
     echo "ROUND $i"
     
     # 执行 make project2c，并将输出保存到文件
-    make project2c > ./out/out-$i.txt
+    make project3a > ./out/out-$i.txt
     
     # 检查 make 命令是否成功
     if [ $? -eq 0 ]; then

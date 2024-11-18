@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -220,6 +221,9 @@ func (r *Raft) loadState(state pb.HardState) {
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
+	if _, ok := r.Prs[to]; !ok {
+		return false
+	}
 	// Your Code Here (2A).
 	entry := []*pb.Entry{}
 	msg := pb.Message{From: r.id, To: to, Term: r.Term}
@@ -271,8 +275,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	// 发送一个空的Heartbeat RPC
-	commit := min(r.Prs[to].Match, r.RaftLog.committed)
-	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat, Commit: commit}
+	// commit := min(r.Prs[to].Match, r.RaftLog.committed)
+	if _, ok := r.Prs[to]; !ok {
+		return
+	}
+	msg := pb.Message{From: r.id, To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat, Commit: util.RaftInvalidIndex}
 	r.msgs = append(r.msgs, msg)
 }
 
@@ -306,6 +313,10 @@ func (r *Raft) tick() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomizedElectionTimeout {
 		msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
+		if r.State != StateLeader {
+			log.Infof("ElectionElapsed, Send MsgHup Message to [%d]", r.id)
+		}
+
 		//r.msgs = append(r.msgs, msg)
 		r.electionElapsed = 0
 		r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
@@ -359,6 +370,9 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	// change the state tot Candidate and increment the term
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	r.State = StateCandidate
 	r.votes = make(map[uint64]bool)
 	r.Vote = r.id
@@ -380,6 +394,9 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	r.State = StateLeader
 	r.Lead = r.id
 	r.PendingConfIndex = 0
@@ -402,7 +419,7 @@ func (r *Raft) becomeLeader() {
 		r.PendingConfIndex = r.RaftLog.LastIndex()
 	}
 	// Leader propose a noop entry
-	// log.Infof("[%d] become Leader\n", r.id)
+	log.Infof("[%d] become Leader\n", r.id)
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.append(entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
@@ -430,6 +447,8 @@ func (r *Raft) isUpToDate(e pb.Entry) bool {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
+	log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+
 	// Your Code Here (2A).
 	if m.Term > r.Term {
 		lead := m.From
@@ -484,7 +503,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to Vote\n", r.id, term, index)
+						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -526,6 +545,9 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 
 	case StateCandidate:
+		if _, ok := r.Prs[r.id]; !ok {
+			return nil
+		}
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
@@ -551,7 +573,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to Vote\n", r.id, term, index)
+						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -606,6 +628,9 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 
 	case StateLeader:
+		if _, ok := r.Prs[r.id]; !ok {
+			return nil
+		}
 		switch m.MsgType {
 		case pb.MessageType_MsgAppend:
 			{
@@ -672,6 +697,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
 						// 发送TimeoutNow消息
+						log.Infof("[%d] Send TimeoutNow Message to [%d]", r.id, m.From)
 						msg := pb.Message{To: m.From, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -698,6 +724,9 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendAppend(m.From)
 			}
 		case pb.MessageType_MsgTransferLeader:
+			if _, ok := r.Prs[m.From]; !ok {
+				return nil
+			}
 			leadTransferee := m.From
 			lastLeadTransferee := r.leadTransferee
 			if lastLeadTransferee != None {
@@ -721,9 +750,11 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			if pr.Match == r.RaftLog.LastIndex() {
 				// 发送TimeoutNow消息
+				log.Infof("[%d] Raft Send TimeoutNow Message to [%d]", r.id, leadTransferee)
 				msg := pb.Message{To: leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
 				r.msgs = append(r.msgs, msg)
 			} else {
+				log.Infof("Transfer Leader is not Match, [%d] Send Append Message to [%d]", r.id, leadTransferee)
 				r.sendAppend(leadTransferee)
 			}
 		}
@@ -824,7 +855,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	// log.Infof("[%d] receive heartbeat from [%d]\n", r.id, m.From)
-	r.RaftLog.commitTo(m.Commit)
+	// r.RaftLog.commitTo(m.Commit)
 	msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgHeartbeatResponse}
 	r.msgs = append(r.msgs, msg)
 }
@@ -882,7 +913,7 @@ func (r *Raft) addNode(id uint64) {
 		// 已经在节点列表中
 		return
 	}
-	r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+	r.Prs[id] = &Progress{Next: 1, Match: 0}
 
 }
 

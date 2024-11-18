@@ -162,6 +162,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 	if pr := rn.Raft.Prs[m.From]; pr != nil || !IsResponseMsg(m.MsgType) {
 		return rn.Raft.Step(m)
 	}
+	// log.Infof("The Not Found Peer is %d", m.From)
 	return ErrStepPeerNotFound
 }
 
@@ -208,7 +209,7 @@ func newReady(raft *Raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	rd := newReady(rn.Raft, rn.prevSoftSt, rn.prevHardSt)
-	rn.Raft.msgs = nil
+	// rn.Raft.msgs = nil
 	return rd
 }
 
