@@ -414,7 +414,15 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		ps.Engines.WriteRaft(raftWb)
 	}
 	ps.Append(ready.Entries, &engine_util.WriteBatch{})
-
+	// 更新 raftState
+	if len(ready.Entries) != 0 {
+		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
+		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
+		if newLastIndex > ps.raftState.LastIndex {
+			ps.raftState.LastIndex = newLastIndex
+			ps.raftState.LastTerm = newLastTerm
+		}
+	}
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
