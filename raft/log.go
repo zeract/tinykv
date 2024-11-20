@@ -77,7 +77,7 @@ func newLog(storage Storage) *RaftLog {
 		panic(err)
 	}
 	// log.Infof("New RaftLog Entry Length is %d\n", len(entries))
-	log.Infof("The firstIndex is %d, LastIndex is %d\n", firstIndex, lastIndex)
+	// log.Infof("The firstIndex is %d, LastIndex is %d\n", firstIndex, lastIndex)
 	log := RaftLog{entries: entries, storage: storage, dummyIndex: firstIndex - 1}
 	// committed和applied从持久化的第一个index的前一个开始
 	log.committed = firstIndex - 1
