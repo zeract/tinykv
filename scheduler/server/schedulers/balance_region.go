@@ -89,7 +89,7 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	}
 	// 按 GetAvailable() 返回值排序
 	sort.Slice(stores, func(i, j int) bool {
-		return stores[i].GetAvailable() > stores[j].GetAvailable() // 从大到小排序
+		return uint64(stores[i].GetRegionSize()) > uint64(stores[j].GetRegionSize()) // 从大到小排序
 	})
 	var source *core.StoreInfo
 	var target *core.StoreInfo
