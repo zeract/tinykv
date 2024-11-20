@@ -14,6 +14,8 @@
 package schedulers
 
 import (
+	"sort"
+
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
@@ -77,6 +79,78 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
+	stores := make([]*core.StoreInfo, 0)
+	all_stores := cluster.GetStores()
+	for _, s := range all_stores {
+		if s.DownTime() < cluster.GetMaxStoreDownTime() {
+			stores = append(stores, s)
+			s.GetAvailable()
+		}
+	}
+	// 按 GetAvailable() 返回值排序
+	sort.Slice(stores, func(i, j int) bool {
+		return stores[i].GetAvailable() > stores[j].GetAvailable() // 从大到小排序
+	})
+	var source *core.StoreInfo
+	var target *core.StoreInfo
+	var regionInfo *core.RegionInfo
+	for i, _ := range stores {
+		cluster.GetPendingRegionsWithLock(stores[i].GetID(),
+			func(regions core.RegionsContainer) { regionInfo = regions.RandomRegion(nil, nil) })
+		if regionInfo != nil {
+			source = stores[i]
+			break
+		}
+		cluster.GetFollowersWithLock(stores[i].GetID(),
+			func(regions core.RegionsContainer) { regionInfo = regions.RandomRegion(nil, nil) })
+		if regionInfo != nil {
+			source = stores[i]
+			break
+		}
+		cluster.GetLeadersWithLock(stores[i].GetID(),
+			func(regions core.RegionsContainer) { regionInfo = regions.RandomRegion(nil, nil) })
+		if regionInfo != nil {
+			source = stores[i]
+			break
+		}
+	}
+	if len(regionInfo.GetStoreIds()) < cluster.GetMaxReplicas() {
+		return nil
+	}
+	target = findSmallestStore(stores, cluster.GetRegionStores(regionInfo))
+	if target == nil {
+		return nil
+	}
+	difference := source.GetRegionSize() - target.GetRegionSize()
+	if difference <= 2*regionInfo.GetApproximateSize() {
+		return nil
+	}
+	// 为target sotre分配一个新的peer
+	newPeer, err := cluster.AllocPeer(target.GetID())
+	if err != nil {
+		panic(err)
+	}
+	peerOperator, err := operator.CreateMovePeerOperator("balance-region", cluster,
+		regionInfo, operator.OpBalance, source.GetID(), target.GetID(), newPeer.GetId())
 
-	return nil
+	return peerOperator
+}
+
+// 查找最小但不在 region_stores 中的 store
+func findSmallestStore(stores, regionStores []*core.StoreInfo) *core.StoreInfo {
+	// 将 region_stores 转为哈希集合
+	regionSet := make(map[*core.StoreInfo]struct{})
+	for _, store := range regionStores {
+		regionSet[store] = struct{}{}
+	}
+
+	// 从尾部开始查找第一个不在 region_stores 中的 store
+	for i := len(stores) - 1; i >= 0; i-- {
+		store := stores[i]
+		if _, exists := regionSet[store]; !exists {
+			return store // 找到后立即返回
+		}
+	}
+
+	return nil // 未找到返回 nil
 }

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/schedulerpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/logutil"
@@ -279,6 +280,32 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	if region == nil {
+		return nil
+	}
+	local_region := c.GetRegion(region.GetID())
+	if local_region == nil {
+		overlap := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, r := range overlap {
+			if r.GetRegionEpoch() == nil || region.GetRegionEpoch() == nil {
+				return errors.Errorf("Epoch is not exist")
+			}
+			if util.IsEpochStale(region.GetRegionEpoch(), r.GetRegionEpoch()) {
+				return ErrRegionIsStale(region.GetMeta(), r.GetMeta())
+			}
+		}
+	} else {
+		if util.IsEpochStale(region.GetRegionEpoch(), local_region.GetRegionEpoch()) {
+			return ErrRegionIsStale(region.GetMeta(), local_region.GetMeta())
+		}
+	}
+	err := c.putRegion(region)
+	if err != nil {
+		return err
+	}
+	for storeId := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(storeId)
+	}
 
 	return nil
 }
