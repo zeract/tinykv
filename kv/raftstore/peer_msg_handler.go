@@ -65,7 +65,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if len(ready.CommittedEntries) > 0 {
 			// 对所有Cmmitted的Entries进行处理
 			for _, entry := range ready.CommittedEntries {
-				applyStateChanged := true
 				wb := new(engine_util.WriteBatch)
 				// 遍历所有的committed Entries，如果是Normal request则继续进行处理
 				if entry.EntryType == eraftpb.EntryType_EntryNormal {
@@ -74,11 +73,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					requests.Unmarshal(entry.Data)
 					// 创建这个RaftCmdRequest对应的WriteBatch
 					if requests.AdminRequest != nil {
-						applyStateChanged = d.applyAdminRequests(requests, entry, wb)
+						d.applyAdminRequests(requests, entry, wb)
 
 					} else {
 						// 将requests中的数据进行apply
-						applyStateChanged = d.applyNormalRequests(requests, entry, wb)
+						d.applyNormalRequests(requests, entry, wb)
 					}
 				} else {
 					// log.Infof("Apply ConfChange Request")
@@ -167,9 +166,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				}
 				// 更新PeerStorage的AppliedIndex
 				d.peerStorage.applyState.AppliedIndex = entry.Index
-				if !applyStateChanged {
-					// continue
-				}
 				// 将更新的ApplyState写入KV DB
 				err := wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 				if err != nil {
@@ -284,14 +280,14 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 	return changed
 }
 
-func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) bool {
+func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) {
 	p := d.FindProposal(entry.Index, entry.Term)
 	err := util.CheckRegionEpoch(requests, d.Region(), true)
 	if err != nil {
 		if p != nil {
 			p.cb.Done(ErrResp(err))
 		}
-		return false
+		return
 	}
 
 	switch requests.AdminRequest.CmdType {
@@ -314,7 +310,7 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 			if p != nil {
 				p.cb.Done(resp)
 			}
-			return false
+			return
 		}
 		// 检查Epoch是否是最新的
 		err := util.CheckRegionEpoch(requests, d.Region(), true)
@@ -323,7 +319,7 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 			if p != nil {
 				p.cb.Done(resp)
 			}
-			return false
+			return
 		}
 		// 检查Split key是否在Region中，避免重复进行Split
 		err = util.CheckKeyInRegion(requests.AdminRequest.Split.SplitKey, d.Region())
@@ -332,7 +328,7 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 			if p != nil {
 				p.cb.Done(resp)
 			}
-			return false
+			return
 		}
 		// 检查Split的新Peers数量与要Split的Peers数量是否一致
 		if len(requests.AdminRequest.Split.NewPeerIds) != len(d.Region().Peers) {
@@ -340,7 +336,7 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 			if p != nil {
 				p.cb.Done(resp)
 			}
-			return false
+			return
 		}
 		// 构造Split的新peers
 		copy_peers := make([]*metapb.Peer, 0)
@@ -398,45 +394,9 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 		}
 		d.notifyHeartbeatScheduler(d.Region(), d.peer)
 		d.notifyHeartbeatScheduler(new_region, peer)
-		// 如果当前store中进行split的peer是leader，那么立刻触发相同store上的peer的选举
-		// if d.RaftGroup.Raft.State == raft.StateLeader {
-		// 	msg := &rspb.RaftMessage{
-		// 		RegionId: new_region.Id,
-		// 		FromPeer: &metapb.Peer{
-		// 			Id:      d.peer.PeerId(),
-		// 			StoreId: d.peer.storeID(),
-		// 		},
-		// 		ToPeer: &metapb.Peer{
-		// 			Id:      peer.PeerId(),
-		// 			StoreId: peer.storeID(),
-		// 		},
-		// 		RegionEpoch: new_region.RegionEpoch,
-		// 		IsTombstone: false,
-		// 		Message: &eraftpb.Message{
-		// 			MsgType: eraftpb.MessageType_MsgTimeoutNow,
-		// 			To:      peer.PeerId(),
-		// 			From:    d.peer.PeerId(),
-		// 		},
-		// 	}
-		// 	d.ctx.router.send(new_region.Id, message.NewMsg(message.MsgTypeRaftMessage, msg))
-		// 	// d.ctx.router.sendStore(message.NewMsg(message.MsgTypeStoreRaftMessage, msg))
-		// } else {
-		// 	d.ctx.storeMeta.RWMutex.Lock()
-		// 	votes := make([]*rspb.RaftMessage, len(d.ctx.storeMeta.pendingVotes))
-		// 	copy(votes, d.ctx.storeMeta.pendingVotes) // 复制出 votes
-		// 	// 清空pendingVotes
-		// 	d.ctx.storeMeta.pendingVotes = d.ctx.storeMeta.pendingVotes[:0]
-		// 	d.ctx.storeMeta.RWMutex.Unlock()
-		// 	for _, msg := range votes {
-		// 		err := d.ctx.router.send(new_region.Id, message.NewMsg(message.MsgTypeRaftMessage, msg))
-		// 		if err != nil {
-		// 			panic(err)
-		// 		}
-		// 	}
-		// }
 
 	}
-	return true
+	return
 }
 
 // 在peerMsgHandler中寻找对应的proposal请求

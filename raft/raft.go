@@ -119,12 +119,6 @@ type Progress struct {
 
 	// the last communication ts
 	lastCommunicteTs int64
-
-	// the Snap Sending State
-	State SnapShotStateType
-
-	// ticks since last send SnapShot
-	snapTick int64
 }
 
 type Raft struct {
@@ -148,8 +142,6 @@ type Raft struct {
 	//  the max time leader communicate with follwers
 	leaderLeaseTimeout int
 
-	// the snapShot Sending max time
-	SnapShotTimeout int
 	// this peer's role
 	State StateType
 
@@ -227,7 +219,6 @@ func newRaft(c *Config) *Raft {
 		RaftLog:                   log,
 		leaderAliveTimeout:        2 * c.ElectionTick,
 		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
-		SnapShotTimeout:           7 * c.ElectionTick / 10,
 	}
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
@@ -260,16 +251,14 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 将entry[Next:]发送给peer
 	pr := r.Prs[to]
 	term, errt := r.RaftLog.Term(pr.Next - 1)
-	log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
+	// log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
 	ents, erre := r.RaftLog.Entries(pr.Next)
 	if errt != nil || erre != nil {
 		// 检查follower是否与leader存在通信
 		if !r.checkFollowerActive(to, int64(r.curTime)) {
 			return false
 		}
-		// if pr.State == StateSending {
-		// 	return false
-		// }
+
 		msg.MsgType = pb.MessageType_MsgSnapshot
 		snap, err := r.RaftLog.snapshot()
 		if err != nil {
@@ -284,9 +273,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 			log.Panicf("Need non-empty snapshot")
 		}
 		msg.Snapshot = &snap
-		// 修改pr的snaap状态
-		pr.State = StateSending
-		pr.snapTick = 0
 		// log.Infof("Send Snapshot[%d,%d] from %d to %d", snap.Metadata.Index, snap.Metadata.Term, r.id, to)
 
 	} else {
@@ -333,7 +319,7 @@ func (r *Raft) tick() {
 	}
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomizedElectionTimeout {
-		log.Infof("Timeout Send MsgHup to election")
+		// log.Infof("Timeout Send MsgHup to election")
 		msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
 
 		//r.msgs = append(r.msgs, msg)
@@ -346,7 +332,6 @@ func (r *Raft) tick() {
 
 	}
 	r.tickLeaderLeaseCheck()
-	r.tickSnapSendingCheck()
 	if r.State == StateLeader {
 		r.heartbeatElapsed++
 		// Leader对每个peer发送一个heartbeat请求
@@ -385,19 +370,6 @@ func (r *Raft) tickLeaderLeaseCheck() {
 			}
 			r.curTime = 0
 
-		}
-	}
-}
-
-func (r *Raft) tickSnapSendingCheck() {
-	if r.State == StateLeader {
-		for _, pr := range r.Prs {
-			if pr.State == StateSending {
-				pr.snapTick++
-				if int(pr.snapTick) >= r.SnapShotTimeout {
-					pr.State = StateNormal
-				}
-			}
 		}
 	}
 }
@@ -487,7 +459,7 @@ func (r *Raft) becomeLeader() {
 		r.PendingConfIndex = r.RaftLog.LastIndex()
 	}
 	// Leader propose a noop entry
-	log.Infof("[%d] become Leader\n", r.id)
+	// log.Infof("[%d] become Leader\n", r.id)
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.append(entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
@@ -518,7 +490,7 @@ func (r *Raft) Step(m pb.Message) error {
 	// if _, ok := r.Prs[m.From]; !ok {
 	// 	return nil
 	// }
-	log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+	// log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
 
 	// Your Code Here (2A).
 	if m.Term > r.Term {
@@ -578,7 +550,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
+						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -649,7 +621,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
+						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -756,7 +728,7 @@ func (r *Raft) Step(m pb.Message) error {
 						// return nil
 					}
 					r.PendingConfIndex = r.RaftLog.LastIndex() + uint64(i) + 1
-					log.Infof("Propose ConfChange Entry")
+					// log.Infof("Propose ConfChange Entry")
 				}
 			}
 			var entries []pb.Entry
@@ -783,10 +755,6 @@ func (r *Raft) Step(m pb.Message) error {
 				pr := r.Prs[m.From]
 				// 更新leader与follower的通信间隔
 				pr.lastCommunicteTs = int64(r.curTime)
-				// 修改SnapShot发送状态
-				if pr.State == StateSending {
-					pr.State = StateNormal
-				}
 				if pr.maybeUpdate(m.Index) {
 					if r.maybeCommit() {
 						// 更新follower的commited
@@ -845,11 +813,11 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			if pr.Match == r.RaftLog.LastIndex() {
 				// 发送TimeoutNow消息
-				log.Infof("[%d] Raft Send TimeoutNow Message to [%d]", r.id, leadTransferee)
+				// log.Infof("[%d] Raft Send TimeoutNow Message to [%d]", r.id, leadTransferee)
 				msg := pb.Message{To: leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
 				r.msgs = append(r.msgs, msg)
 			} else {
-				log.Infof("Transfer Leader is not Match, [%d] Send Append Message to [%d]", r.id, leadTransferee)
+				// log.Infof("Transfer Leader is not Match, [%d] Send Append Message to [%d]", r.id, leadTransferee)
 				r.sendAppend(leadTransferee)
 			}
 		}
@@ -868,7 +836,7 @@ func (r *Raft) hasMajority() bool {
 			trueCount++
 		}
 	}
-	log.Infof("The votes count is %d, the Prs is %d", trueCount, len(r.Prs))
+	// log.Infof("The votes count is %d, the Prs is %d", trueCount, len(r.Prs))
 	if trueCount >= r.quorum() {
 		// 得到超过一半的票，成为leader
 		return true
@@ -939,9 +907,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// log.Infof("[%d] Raftlog Entries is %v", r.id, r.RaftLog.unstableEntries())
 	} else {
 		// 添加日志失败
-		term, _ := r.RaftLog.Term(m.Index)
-		log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
-			r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+		// term, _ := r.RaftLog.Term(m.Index)
+		// log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
+		// 	r.id, term, m.Index, m.LogTerm, m.Index, m.From)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
 		r.msgs = append(r.msgs, msg)
 	}
@@ -1009,9 +977,11 @@ func (r *Raft) addNode(id uint64) {
 		// 已经在节点列表中
 		return
 	}
-	log.Infof("[%d] Add Noede [%d]", r.id, id)
+	// log.Infof("[%d] Add Noede [%d]", r.id, id)
 	r.Prs[id] = &Progress{Next: 1, Match: 0}
-
+	if r.State == StateLeader {
+		r.sendHeartbeat(id)
+	}
 }
 
 // removeNode remove a node from raft group
@@ -1024,7 +994,7 @@ func (r *Raft) removeNode(id uint64) {
 	if len(r.Prs) == 0 {
 		return
 	}
-	log.Infof("[%d] Delete Noede [%d]", r.id, id)
+	// log.Infof("[%d] Delete Noede [%d]", r.id, id)
 	// 删除节点后，可能可以进行commit操作
 	if r.State == StateLeader {
 		if len(r.Prs) != 0 {

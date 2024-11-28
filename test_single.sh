@@ -9,7 +9,7 @@ for ((i=1; i<=5; i++));
 do 
     echo "ROUND $i"
     rm -rf /tmp/*test-raftstore*
-    GO111MODULE=on go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run ^TestConfChangeRecover3B > ./out/out-$i.txt
+    GO111MODULE=on go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run ^TestOnePartition2B > ./out/out-$i.txt
     rm -rf /tmp/*test-raftstore*
     # 检查 make 命令是否成功
     if grep -q "FAIL" ./out/out-$i.txt; then
