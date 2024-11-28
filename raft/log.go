@@ -446,11 +446,11 @@ func (l *RaftLog) snapRestore(snap pb.Snapshot) {
 
 func (l *RaftLog) stableSnapTo(i uint64) {
 	if l.pendingSnapshot != nil {
-		log.Infof("Ready snap index is %d, PendingSnapshot is %d", i, l.pendingSnapshot.Metadata.Index)
+		// log.Infof("Ready snap index is %d, PendingSnapshot is %d", i, l.pendingSnapshot.Metadata.Index)
 	}
 	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
 		// 传入索引刚好是快照的索引，说明快照已经保存，当前快照可以置空
-		log.Infof("Stable Snap to %d, now Snap is nil", i)
+		// log.Infof("Stable Snap to %d, now Snap is nil", i)
 		l.pendingSnapshot = nil
 	}
 }

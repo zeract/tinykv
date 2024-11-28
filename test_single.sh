@@ -4,18 +4,14 @@
 pass_count=0
 fail_count=0
 
-# 创建输出目录
-mkdir -p ./out
-
-# 循环执行50次
+# 循环执行5次
 for ((i=1; i<=5; i++)); 
 do 
     echo "ROUND $i"
-    
-    # 执行 make project3b，并将输出保存到文件
-    make project3b > ./out/out-$i.txt
-    
-    # 检查输出文件中是否包含 "FAIL"
+    rm -rf /tmp/*test-raftstore*
+    GO111MODULE=on go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run ^TestConfChangeRecover3B > ./out/out-$i.txt
+    rm -rf /tmp/*test-raftstore*
+    # 检查 make 命令是否成功
     if grep -q "FAIL" ./out/out-$i.txt; then
         ((fail_count++))  # 如果输出中有 "FAIL"，增加失败计数
         echo "FAIL"

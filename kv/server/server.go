@@ -60,6 +60,7 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 		return nil, nil
 	}
 	response := &kvrpcpb.GetResponse{}
+	// 通过Context得到reader
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
 		if regionErr, ok := err.(*raft_storage.RegionError); ok {
@@ -68,12 +69,14 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 		return response, err
 	}
 	defer reader.Close()
+	// 根据reader和version构建MvccTxn
 	txn := mvcc.NewMvccTxn(reader, req.Version)
 	// 获取Lock
 	lock, err := txn.GetLock(key)
 	if err != nil {
 		panic(err)
 	}
+	// 如果lock的startTS小于txn的StartTS，那么就返回LockInfo
 	if lock != nil && lock.Ts <= txn.StartTS {
 		response.Error = &kvrpcpb.KeyError{
 			Locked: &kvrpcpb.LockInfo{
@@ -118,14 +121,17 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		return response, err
 	}
 	defer reader.Close()
+	// 创建MvccTxn
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
 
 	var keyErrs []*kvrpcpb.KeyError
 	for _, m := range req.Mutations {
+		// 通过MostRecentWrite来获取最新的write
 		write, ts, err := txn.MostRecentWrite(m.Key)
 		if err != nil {
 			panic(err)
 		}
+		// 判断write的commit timestamp是否在transaction之前
 		if write != nil && req.StartVersion <= ts {
 			keyErrs = append(keyErrs, &kvrpcpb.KeyError{
 				Conflict: &kvrpcpb.WriteConflict{
@@ -139,7 +145,8 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		if err != nil {
 			panic(err)
 		}
-		if lock != nil && lock.Ts <= txn.StartTS {
+		// 判断lock的timestamp是否与request一致
+		if lock != nil && lock.Ts != req.StartVersion {
 			keyErrs = append(keyErrs, &kvrpcpb.KeyError{
 				Locked: &kvrpcpb.LockInfo{
 					PrimaryLock: lock.Primary,
@@ -150,6 +157,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 			continue
 		}
 		var kind mvcc.WriteKind
+		// 根据mutation的type来进行写操作
 		switch m.Op {
 		case kvrpcpb.Op_Put:
 			kind = mvcc.WriteKindPut
@@ -168,10 +176,12 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		})
 
 	}
+	// 如果有错误，就进行返回
 	if len(keyErrs) > 0 {
 		response.Errors = keyErrs
 		return response, nil
 	}
+	// 将write写入数据库中
 	err = server.storage.Write(req.Context, txn.Writes())
 	if err != nil {
 		panic(err)

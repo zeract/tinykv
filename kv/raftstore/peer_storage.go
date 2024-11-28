@@ -413,6 +413,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		ps.Engines.WriteKV(kvWb)
 		ps.Engines.WriteRaft(raftWb)
 	}
+	// 对raft log进行持久化操作
 	ps.Append(ready.Entries, &engine_util.WriteBatch{})
 	// 更新 raftState
 	if len(ready.Entries) != 0 {

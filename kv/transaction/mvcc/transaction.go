@@ -158,6 +158,7 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	// 使用TsMax来查找最近的值
 	iter.Seek(EncodeKey(key, TsMax))
 	value, _ := iter.Item().Value()
 	defer iter.Close()
@@ -165,10 +166,12 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	if value == nil {
 		return nil, 0, nil
 	}
+	// 从value中获取对应的write数据结构
 	write, err := ParseWrite(value)
 	if err != nil {
 		panic(err)
 	}
+	// 一直迭代write直到write的StartTS与MvccTxn的StartTS一致
 	for write.StartTS > txn.StartTS {
 		iter.Next()
 		if !iter.Valid() {
@@ -183,11 +186,13 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 			panic(err)
 		}
 	}
+	// 如果找到一致的write，返回write和对应的commited timestamp
 	if write.StartTS == txn.StartTS {
 		// 返回commited timestamp
 		k := iter.Item().Key()
 		return write, decodeTimestamp(k), nil
 	}
+	// 没有找到，返回nil
 	return nil, 0, nil
 }
 
@@ -196,6 +201,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	// 寻找最近的write
 	iter.Seek(EncodeKey(key, TsMax))
 	k := iter.Item().Key()
 	defer iter.Close()
@@ -203,12 +209,14 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 		return nil, 0, nil
 	}
 	user := DecodeUserKey(k)
+	// 判断write的user key与提供的user key是否一致
 	if bytes.Equal(key, user) {
 		ts := decodeTimestamp(k)
 		value, _ := iter.Item().Value()
 		if value == nil {
 			return nil, 0, nil
 		}
+		// 解析write结构
 		write, err := ParseWrite(value)
 		if err != nil {
 			panic(err)

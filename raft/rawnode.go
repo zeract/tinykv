@@ -17,7 +17,6 @@ package raft
 import (
 	"errors"
 
-	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -253,7 +252,7 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.stableTo(e.Index, e.Term)
 	}
 	if !IsEmptySnap(&rd.Snapshot) {
-		log.Infof("Call Advance, Snap is not empty")
+		// log.Infof("Call Advance, Snap is not empty")
 		rn.Raft.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
 		rn.Raft.RaftLog.maybeCompact()
 	}
