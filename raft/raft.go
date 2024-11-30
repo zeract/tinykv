@@ -251,7 +251,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 将entry[Next:]发送给peer
 	pr := r.Prs[to]
 	term, errt := r.RaftLog.Term(pr.Next - 1)
-	// log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
+	log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
 	ents, erre := r.RaftLog.Entries(pr.Next)
 	if errt != nil || erre != nil {
 		// 检查follower是否与leader存在通信
@@ -319,7 +319,7 @@ func (r *Raft) tick() {
 	}
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomizedElectionTimeout {
-		// log.Infof("Timeout Send MsgHup to election")
+		log.Infof("Timeout Send MsgHup to [%d]", r.id)
 		msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
 
 		//r.msgs = append(r.msgs, msg)
@@ -459,7 +459,7 @@ func (r *Raft) becomeLeader() {
 		r.PendingConfIndex = r.RaftLog.LastIndex()
 	}
 	// Leader propose a noop entry
-	// log.Infof("[%d] become Leader\n", r.id)
+	log.Infof("[%d] become Leader\n", r.id)
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.append(entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
@@ -490,20 +490,30 @@ func (r *Raft) Step(m pb.Message) error {
 	// if _, ok := r.Prs[m.From]; !ok {
 	// 	return nil
 	// }
-	// log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+	log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
 
 	// Your Code Here (2A).
 	if m.Term > r.Term {
 		lead := m.From
-		// log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
-		// 	r.id, r.Term, m.MsgType, m.From, m.Term)
+		log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
 		if m.MsgType == pb.MessageType_MsgRequestVote {
+			// if r.Lead != None && r.electionElapsed < r.electionTimeout {
+			// 	return nil
+			// }
 			lead = None
 		}
-		r.becomeFollower(m.Term, lead)
+		r.becomeFollower(r.Term, lead)
 	}
 	if m.MsgType == pb.MessageType_MsgRequestVote {
+		if r.Term < m.Term {
+			r.Vote = None
+			r.Term = m.Term
+			if r.State != StateFollower {
+				r.becomeFollower(r.Term, None)
+			}
+		}
 		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
 		CanVote := m.Term > r.Term || r.Vote == None || r.Vote == m.From
 		if CanVote && r.isUpToDate(entry) {
@@ -511,6 +521,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.msgs = append(r.msgs, msg)
 			r.electionElapsed = 0
 			r.Vote = m.From
+			log.Infof("[%d] Votes for [%d]", r.id, m.From)
 			// r.becomeFollower(m.Term, None)
 		} else {
 			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
@@ -550,7 +561,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
+						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -621,7 +632,7 @@ func (r *Raft) Step(m pb.Message) error {
 					if key != r.id {
 						index := r.RaftLog.LastIndex()
 						term, _ := r.RaftLog.Term(index)
-						// log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
+						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
 						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -681,7 +692,7 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgAppend:
 			{
 				if m.Term >= r.Term {
-					// log.Printf("Leader [%d] become Follower\n", r.id)
+					// log.Infof("Leader [%d] become Follower\n", r.id)
 					r.becomeFollower(m.Term, m.From)
 				}
 			}
@@ -774,7 +785,7 @@ func (r *Raft) Step(m pb.Message) error {
 
 			} else {
 				// append失败的index,减1继续发送append请求
-				r.Prs[m.From].Next = min(m.Index, r.Prs[m.From].Next-1)
+				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
@@ -782,6 +793,12 @@ func (r *Raft) Step(m pb.Message) error {
 			pr := r.Prs[m.From]
 			// 更新leader与follower的通信间隔
 			pr.lastCommunicteTs = int64(r.curTime)
+			if r.Term < m.Term {
+				r.Term = m.Term
+				if r.State != StateFollower {
+					r.becomeFollower(r.Term, None)
+				}
+			}
 			// 如果follower的Match index小于Leader的lastindex，就向follower发送append请求
 			if pr.Match < r.RaftLog.LastIndex() {
 				r.sendAppend(m.From)
@@ -882,8 +899,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 如果发过来的消息索引小于当前commit索引，就返回当前commit索引
 	if m.Term >= r.Term {
 		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
 	} else {
-		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Term: r.Term, Reject: true}
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
 		r.msgs = append(r.msgs, msg)
 		return
 	}
@@ -903,13 +923,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// 添加日志成功，应答当前的最后索引回去
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: mlastIndex, Term: r.Term}
 		r.msgs = append(r.msgs, msg)
-		// log.Infof("[%d] Receive Append from [%d], after Append commited is %d, LastIndex is %d\n", r.id, m.From, r.RaftLog.committed, mlastIndex)
+		log.Infof("[%d] Receive Append from [%d], after Append commited is %d, LastIndex is %d\n", r.id, m.From, r.RaftLog.committed, mlastIndex)
 		// log.Infof("[%d] Raftlog Entries is %v", r.id, r.RaftLog.unstableEntries())
 	} else {
 		// 添加日志失败
 		// term, _ := r.RaftLog.Term(m.Index)
 		// log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
 		// 	r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
 		r.msgs = append(r.msgs, msg)
 	}
@@ -918,7 +939,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	// log.Infof("[%d] receive heartbeat from [%d]\n", r.id, m.From)
+	log.Infof("[%d] receive heartbeat from [%d]\n", r.id, m.From)
+	if r.Term <= m.Term {
+		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
+	}
 	// r.RaftLog.commitTo(m.Commit)
 	msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgHeartbeatResponse}
 	r.msgs = append(r.msgs, msg)
@@ -927,16 +954,22 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-	// sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if r.Term < m.Term {
+		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
+	}
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.snapRestore(*m.Snapshot) {
-		// log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
-		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()}
 		r.msgs = append(r.msgs, msg)
 		// 发送SnapShot完成
 	} else {
-		// log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
-		// 	r.id, r.RaftLog.committed, sindex, sterm)
+		log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed}
 		r.msgs = append(r.msgs, msg)
 	}

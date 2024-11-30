@@ -13,7 +13,7 @@ do
     echo "ROUND $i"
     
     # 执行 make project3b，并将输出保存到文件
-    make project3b > ./out/out-$i.txt
+    make project3a > ./out/out-$i.txt
     
     # 检查输出文件中是否包含 "FAIL"
     if grep -q "FAIL" ./out/out-$i.txt; then

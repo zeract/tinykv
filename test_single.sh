@@ -5,7 +5,7 @@ pass_count=0
 fail_count=0
 
 # 循环执行5次
-for ((i=1; i<=5; i++)); 
+for ((i=1; i<=20; i++)); 
 do 
     echo "ROUND $i"
     rm -rf /tmp/*test-raftstore*
