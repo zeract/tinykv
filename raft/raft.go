@@ -499,12 +499,11 @@ func (r *Raft) Step(m pb.Message) error {
 			r.id, r.Term, m.MsgType, m.From, m.Term)
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
 		if m.MsgType == pb.MessageType_MsgRequestVote {
-			// if r.Lead != None && r.electionElapsed < r.electionTimeout {
-			// 	return nil
-			// }
 			lead = None
 		}
-		r.becomeFollower(r.Term, lead)
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, lead)
+		}
 	}
 	if m.MsgType == pb.MessageType_MsgRequestVote {
 		if r.Term < m.Term {
