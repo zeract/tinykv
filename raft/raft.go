@@ -34,6 +34,7 @@ const (
 	StateFollower StateType = iota
 	StateCandidate
 	StateLeader
+	StatePreCandidate
 )
 
 type SnapShotStateType uint64
@@ -41,6 +42,24 @@ type SnapShotStateType uint64
 const (
 	StateNormal SnapShotStateType = iota
 	StateSending
+)
+
+// CampaignType represents the type of campaigning
+// the reason we use the type of string instead of uint64
+// is because it's simpler to compare and fill in raft entries
+type CampaignType string
+
+// Possible values for CampaignType
+const (
+	// campaignPreElection represents the first phase of a normal election when
+	// Config.PreVote is true.
+	campaignPreElection CampaignType = "CampaignPreElection"
+	// campaignElection represents a normal (time-based) election (the second phase
+	// of the election when Config.PreVote is true).
+	campaignElection CampaignType = "CampaignElection"
+	// campaignTransfer represents the type of leader transfer
+	// 由于leader转让发起的竞选
+	campaignTransfer CampaignType = "CampaignTransfer"
 )
 
 var stmap = [...]string{
@@ -154,6 +173,9 @@ type Raft struct {
 	// the leader id
 	Lead uint64
 
+	// PreVote Config
+	preVote bool
+
 	// heartbeat interval, should send
 	heartbeatTimeout int
 	// baseline of election interval
@@ -219,6 +241,7 @@ func newRaft(c *Config) *Raft {
 		RaftLog:                   log,
 		leaderAliveTimeout:        2 * c.ElectionTick,
 		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
+		preVote:                   false,
 	}
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
@@ -263,7 +286,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		snap, err := r.RaftLog.snapshot()
 		if err != nil {
 			if err == ErrSnapshotTemporarilyUnavailable {
-				log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				// log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
 				return false
 			}
 			log.Panic(err)
@@ -382,6 +405,9 @@ func (r *Raft) checkFollowerActive(to uint64, curTs int64) bool {
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	// change the state of raft node
 	r.State = StateFollower
 	// change the leader
@@ -403,6 +429,18 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 		}
 	}
 
+}
+
+// becomePreCandidate transform this peer's state to Precandidate
+func (r *Raft) becomePreCandidate() {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+	if r.State == StateLeader {
+		log.Panicf("Invalid transition [Leader -> preCandidate]")
+	}
+	// change State to PreCandidate
+	r.State = StatePreCandidate
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -470,6 +508,50 @@ func (r *Raft) becomeLeader() {
 
 }
 
+func (r *Raft) campaign(t CampaignType) {
+	var term uint64
+	var voteMsg pb.MessageType
+	if t == campaignPreElection {
+		r.becomePreCandidate()
+		voteMsg = pb.MessageType_MsgPreRequestVote
+		// PreVote RPCs are sent for the next term before we've incremented r.Term.
+		term = r.Term + 1
+	} else {
+		r.becomeCandidate()
+		voteMsg = pb.MessageType_MsgRequestVote
+		term = r.Term
+	}
+
+	// Candidate vote for self
+	r.votes[r.id] = true
+	if r.hasMajority() {
+		if t == campaignPreElection {
+			r.campaign(campaignElection)
+		} else {
+			// 如果给自己投票之后，刚好超过半数的通过，那么就成为新的leader
+			r.becomeLeader()
+			for id := range r.Prs {
+				if id != r.id {
+					// r.sendNoopEntry(id)
+					r.sendAppend(id)
+				}
+			}
+		}
+	} else {
+		for id := range r.Prs {
+			if id != r.id {
+				index := r.RaftLog.LastIndex()
+				logTerm, _ := r.RaftLog.Term(index)
+				log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
+				msg := pb.Message{From: r.id, To: id, MsgType: voteMsg, Term: term, Index: index, LogTerm: logTerm}
+				r.msgs = append(r.msgs, msg)
+			}
+
+		}
+	}
+
+}
+
 func (r *Raft) isUpToDate(e pb.Entry) bool {
 	index := r.RaftLog.LastIndex()
 	term, _ := r.RaftLog.Term(index)
@@ -484,6 +566,19 @@ func (r *Raft) isUpToDate(e pb.Entry) bool {
 	return false
 }
 
+// voteResponseType maps vote and prevote message types to their corresponding responses.
+func voteRespMsgType(msgt pb.MessageType) pb.MessageType {
+	switch msgt {
+	case pb.MessageType_MsgRequestVote:
+		return pb.MessageType_MsgRequestVoteResponse
+	case pb.MessageType_MsgPreRequestVote:
+		return pb.MessageType_MsgPreRequestVoteResponse
+	default:
+		log.Panicf("not a vote message: %s", msgt)
+	}
+	panic("VoteResp Err")
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
@@ -495,17 +590,23 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	if m.Term > r.Term {
 		lead := m.From
-		log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
-			r.id, r.Term, m.MsgType, m.From, m.Term)
+		// log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
+		// 	r.id, r.Term, m.MsgType, m.From, m.Term)
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
 		if m.MsgType == pb.MessageType_MsgRequestVote {
 			lead = None
 		}
-		if r.State != StateFollower {
-			r.becomeFollower(r.Term, lead)
+		switch {
+		case m.MsgType == pb.MessageType_MsgPreRequestVote:
+		case m.MsgType == pb.MessageType_MsgPreRequestVoteResponse && !m.Reject:
+		default:
+			if r.State != StateFollower {
+				r.becomeFollower(r.Term, lead)
+			}
 		}
+
 	}
-	if m.MsgType == pb.MessageType_MsgRequestVote {
+	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
 		if r.Term < m.Term {
 			r.Vote = None
 			r.Term = m.Term
@@ -516,14 +617,15 @@ func (r *Raft) Step(m pb.Message) error {
 		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
 		CanVote := m.Term > r.Term || r.Vote == None || r.Vote == m.From
 		if CanVote && r.isUpToDate(entry) {
-			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: r.Term}
+			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Term: r.Term}
 			r.msgs = append(r.msgs, msg)
 			r.electionElapsed = 0
 			r.Vote = m.From
 			log.Infof("[%d] Votes for [%d]", r.id, m.From)
 			// r.becomeFollower(m.Term, None)
 		} else {
-			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true, Term: r.Term}
+			log.Infof("[%d] Reject Vote for [%d]", r.id, m.From)
+			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Reject: true, Term: r.Term}
 			r.msgs = append(r.msgs, msg)
 		}
 		return nil
@@ -541,31 +643,13 @@ func (r *Raft) Step(m pb.Message) error {
 				log.Panic(err)
 			}
 			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
-			r.becomeCandidate()
-			// Candidate vote for self
-			r.votes[r.id] = true
-			if r.hasMajority() {
-				r.becomeLeader()
-				for id := range r.Prs {
-					if id != r.id {
-						// r.sendNoopEntry(id)
-						r.sendAppend(id)
-					}
-				}
+			if r.preVote {
+				r.campaign(campaignPreElection)
 			} else {
-				for key := range r.Prs {
-					if key != r.id {
-						index := r.RaftLog.LastIndex()
-						term, _ := r.RaftLog.Term(index)
-						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
-						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
-						r.msgs = append(r.msgs, msg)
-					}
-
-				}
+				r.campaign(campaignElection)
 			}
 
 		case pb.MessageType_MsgAppend:
@@ -586,10 +670,12 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgTimeoutNow:
 			// 当前节点必须在集群中
 			if _, ok := r.Prs[r.id]; ok {
-				// 向自己发送msgHup请求
-				msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
-				// MsgHup是一个local message，不能添加到r.msgs中
-				r.Step(msg)
+				// // 向自己发送msgHup请求
+				// msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
+				// // MsgHup是一个local message，不能添加到r.msgs中
+				// r.Step(msg)
+				// 发起选举
+				r.campaign(campaignElection)
 			}
 
 		case pb.MessageType_MsgTransferLeader:
@@ -601,7 +687,15 @@ func (r *Raft) Step(m pb.Message) error {
 			r.msgs = append(r.msgs, m)
 		}
 
-	case StateCandidate:
+	case StateCandidate, StatePreCandidate:
+		var myVoteRespType pb.MessageType
+		if r.State == StatePreCandidate {
+			log.Infof("[%d] is PreCandidate,So Receive MsgPreRequestVoteResponse", r.id)
+			myVoteRespType = pb.MessageType_MsgPreRequestVoteResponse
+		} else {
+			log.Infof("[%d] is Candidate,So Receive MsgRequestVoteResponse", r.id)
+			myVoteRespType = pb.MessageType_MsgRequestVoteResponse
+		}
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			if _, ok := r.Prs[r.id]; !ok {
@@ -612,35 +706,18 @@ func (r *Raft) Step(m pb.Message) error {
 				log.Panic(err)
 			}
 			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
-			r.becomeCandidate()
-			// Candidate vote for self
-			r.votes[r.id] = true
-			if r.hasMajority() {
-				r.becomeLeader()
-				for id := range r.Prs {
-					if id != r.id {
-						// r.sendNoopEntry(id)
-						r.sendAppend(id)
-					}
-				}
+			if r.preVote {
+				r.campaign(campaignPreElection)
 			} else {
-				for key := range r.Prs {
-					if key != r.id {
-						index := r.RaftLog.LastIndex()
-						term, _ := r.RaftLog.Term(index)
-						log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, key)
-						msg := pb.Message{From: r.id, To: key, MsgType: pb.MessageType_MsgRequestVote, Term: r.Term, Index: index, LogTerm: term}
-						r.msgs = append(r.msgs, msg)
-					}
-				}
+				r.campaign(campaignElection)
 			}
 
-		case pb.MessageType_MsgRequestVoteResponse:
+		case myVoteRespType:
 			if !m.Reject {
-				// log.Infof("[%d] Receive RequestVoteResponse Msg from [%d]", r.id, m.From)
+				// log.Infof("[%d] Receive VoteResponse Msg from [%d]", r.id, m.From)
 				r.votes[m.From] = true
 				trueCount := 0
 				// 统计投票的数量
@@ -649,14 +726,20 @@ func (r *Raft) Step(m pb.Message) error {
 						trueCount++
 					}
 				}
-
+				log.Infof("[%d] get %d votes", r.id, trueCount)
 				if trueCount >= r.quorum() {
-					// 得到超过一半的票，成为leader
-					r.becomeLeader()
-					for id := range r.Prs {
-						if id != r.id {
-							// r.sendNoopEntry(id)
-							r.sendAppend(id)
+					if r.State == StatePreCandidate {
+						// PreVotes结束，可以正常进行选举
+						log.Infof("[%d] Win PreVote, Start Election", r.id)
+						r.campaign(campaignElection)
+					} else {
+						// 得到超过一半的票，成为leader
+						r.becomeLeader()
+						for id := range r.Prs {
+							if id != r.id {
+								// r.sendNoopEntry(id)
+								r.sendAppend(id)
+							}
 						}
 					}
 				}
@@ -926,9 +1009,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// log.Infof("[%d] Raftlog Entries is %v", r.id, r.RaftLog.unstableEntries())
 	} else {
 		// 添加日志失败
-		// term, _ := r.RaftLog.Term(m.Index)
-		// log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
-		// 	r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+		term, _ := r.RaftLog.Term(m.Index)
+		log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
+			r.id, term, m.Index, m.LogTerm, m.Index, m.From)
 
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
 		r.msgs = append(r.msgs, msg)
@@ -938,7 +1021,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	log.Infof("[%d] receive heartbeat from [%d]\n", r.id, m.From)
+	// log.Infof("[%d] receive heartbeat from [%d]\n", r.id, m.From)
 	if r.Term <= m.Term {
 		r.Term = m.Term
 		if r.State != StateFollower {
@@ -959,16 +1042,16 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 			r.becomeFollower(r.Term, None)
 		}
 	}
-	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	// sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.snapRestore(*m.Snapshot) {
-		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
-			r.id, r.RaftLog.committed, sindex, sterm)
+		// log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+		// 	r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()}
 		r.msgs = append(r.msgs, msg)
 		// 发送SnapShot完成
 	} else {
-		log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
-			r.id, r.RaftLog.committed, sindex, sterm)
+		// log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+		// 	r.id, r.RaftLog.committed, sindex, sterm)
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed}
 		r.msgs = append(r.msgs, msg)
 	}

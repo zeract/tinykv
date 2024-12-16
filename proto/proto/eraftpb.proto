@@ -66,6 +66,10 @@ enum MessageType {
     // 'MessageType_MsgTimeoutNow' send from the leader to the leadership transfer target, to let
     // the transfer target timeout immediately and start a new election.
     MsgTimeoutNow = 12;
+    // 'MessageType_MsgPreRequestVote' requests Prevotes for election
+    MsgPreRequestVote = 13;
+    // 'MessageType_MsgPreRequestVoteResponse' contains responses from Prevoting request.
+    MsgPreRequestVoteResponse = 14;
 }
 
 message Message {
