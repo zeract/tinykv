@@ -80,6 +80,8 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	if config.ID == 0 {
 		panic("config.ID must not be zero")
 	}
+	// 设置prevote为true
+	config.preVote = true
 	r := newRaft(config)
 	rn := &RawNode{
 		Raft: r,

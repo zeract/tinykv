@@ -83,6 +83,9 @@ message Message {
     uint64 commit = 8;
     Snapshot snapshot = 9;
     bool reject = 10;
+    uint64 xterm = 11;
+    uint64 xindex = 12;
+    uint64 xlen = 13;
 }
 
 // HardState contains the state of a node need to be peristed, including the current term, commit index 

@@ -109,6 +109,9 @@ type Config struct {
 	// Applied. If Applied is unset when restarting, raft might return previous
 	// applied entries. This is a very application dependent configuration.
 	Applied uint64
+
+	// PreVote Flag
+	preVote bool
 }
 
 func (c *Config) validate() error {
@@ -241,7 +244,7 @@ func newRaft(c *Config) *Raft {
 		RaftLog:                   log,
 		leaderAliveTimeout:        2 * c.ElectionTick,
 		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
-		preVote:                   false,
+		preVote:                   c.preVote,
 	}
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
@@ -866,8 +869,28 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 
 			} else {
+				// Follower的log length太短, nextIndex = Xlen
+				if m.Xlen < m.Index {
+					// if m.Xlen == 0 {
+					// 	// 如果Xlen为0，那么说明Follower的log是空的，需要从1开始进行append
+					// 	m.Xlen = 1
+					// }
+					log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
+					r.Prs[m.From].Next = m.Xlen + 1
+				} else {
+					index := r.RaftLog.FindLastTerm(m.Xterm)
+					if index == 0 {
+						// Leader没有XTerm，nextIndex = Xindex
+						log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
+						r.Prs[m.From].Next = m.Xindex
+					} else {
+						// Leader有Xterm, nextIndex = leader's last entry for XTerm
+						log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
+						r.Prs[m.From].Next = index
+					}
+				}
 				// append失败的index,减1继续发送append请求
-				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
+				// r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
@@ -1012,8 +1035,19 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		term, _ := r.RaftLog.Term(m.Index)
 		log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
 			r.id, term, m.Index, m.LogTerm, m.Index, m.From)
-
+		xlen := r.RaftLog.LastIndex()
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
+		// 如果Follower的log length小于nextIndex,那么说明follower's log太短,这里没有冲突的Term
+		if xlen < m.Index {
+			log.Infof("Follower too short, xlen is %d", xlen)
+			msg.Xlen = xlen
+		} else {
+			// 寻找冲突的Term和该Term在Follower's log中的第一个entry index
+			xindex := r.RaftLog.FindFirstTerm(term)
+			msg.Xindex = xindex
+			msg.Xterm = term
+		}
+
 		r.msgs = append(r.msgs, msg)
 	}
 }

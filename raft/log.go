@@ -296,6 +296,42 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 	return 0
 }
 
+// 根据传入的Term，寻找该Term的第一个Entry
+func (l *RaftLog) FindFirstTerm(term uint64) uint64 {
+	lst := l.LastIndex()
+	// 从committed之后开始查找Term对应的Entry，因为即使entry是stabled的被持久化在storage中
+	// 但是如果没有被committed，还是可以被修改进行同步
+	for i := l.committed + 1; i <= lst; i++ {
+		log_term, err := l.Term(i)
+		if err != nil {
+			panic(err)
+		}
+		if log_term == term {
+			return i
+		}
+	}
+	// 如果找不到就返回committed的下一个位置
+	return l.committed + 1
+}
+
+// 根据传入的Term，寻找该Term的最后一个Entry
+func (l *RaftLog) FindLastTerm(term uint64) uint64 {
+	length := l.LastIndex()
+
+	// 从后往前遍历entries，找到最后一个匹配的entry
+	for i := length; i >= 1; i-- {
+		log_term, err := l.Term(i)
+		if err != nil {
+			panic(err)
+		}
+		if log_term == term {
+			return i
+		}
+	}
+	// 没有找到该Term,返回0
+	return 0
+}
+
 func (l *RaftLog) firstIndex() uint64 {
 	// 如果存在snapshot则返回快照中的数据
 	if l.pendingSnapshot != nil {
