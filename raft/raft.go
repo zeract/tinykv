@@ -179,6 +179,13 @@ type Raft struct {
 	// PreVote Config
 	preVote bool
 
+	// Debug Config
+	debug bool
+
+	// 在某一轮心跳中，每个 follower 是否给了 heartbeat 回应，用于应对网络分区
+	// 每一次 electionTimeout ，就重置
+	heartbeatResp map[uint64]bool
+
 	// heartbeat interval, should send
 	heartbeatTimeout int
 	// baseline of election interval
@@ -245,6 +252,7 @@ func newRaft(c *Config) *Raft {
 		leaderAliveTimeout:        2 * c.ElectionTick,
 		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
 		preVote:                   c.preVote,
+		debug:                     false,
 	}
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
@@ -277,7 +285,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 将entry[Next:]发送给peer
 	pr := r.Prs[to]
 	term, errt := r.RaftLog.Term(pr.Next - 1)
-	log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
+	if r.debug {
+		log.Infof("[%d] Send Append Entry[%d:%d] to [%d]", r.id, pr.Next, r.RaftLog.LastIndex(), to)
+	}
 	ents, erre := r.RaftLog.Entries(pr.Next)
 	if errt != nil || erre != nil {
 		// 检查follower是否与leader存在通信
@@ -289,7 +299,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		snap, err := r.RaftLog.snapshot()
 		if err != nil {
 			if err == ErrSnapshotTemporarilyUnavailable {
-				// log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				if r.debug {
+					log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				}
 				return false
 			}
 			log.Panic(err)
@@ -299,7 +311,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 			log.Panicf("Need non-empty snapshot")
 		}
 		msg.Snapshot = &snap
-		// log.Infof("Send Snapshot[%d,%d] from %d to %d", snap.Metadata.Index, snap.Metadata.Term, r.id, to)
+		if r.debug {
+			log.Infof("Send Snapshot[%d,%d] from %d to %d", snap.Metadata.Index, snap.Metadata.Term, r.id, to)
+		}
 
 	} else {
 		// 可以正确取到term和entries
@@ -318,6 +332,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.Index = r.Prs[to].Next - 1
 		msg.LogTerm = term
 		msg.Commit = r.RaftLog.committed
+		// Pipeline 优化？
+		// r.Prs[to].Next = msg.Index + uint64(len(ents)) + 1
 		// log.Printf("The Append entry is %v\n", entry[0])
 	}
 
@@ -344,22 +360,44 @@ func (r *Raft) tick() {
 		return
 	}
 	r.electionElapsed++
-	if r.electionElapsed >= r.randomizedElectionTimeout {
-		log.Infof("Timeout Send MsgHup to [%d]", r.id)
-		msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
+	switch r.State {
+	case StateFollower, StateCandidate:
+		if r.electionElapsed >= r.randomizedElectionTimeout {
+			if r.debug {
+				log.Infof("Timeout Send MsgHup to [%d]", r.id)
+			}
+			r.electionElapsed = 0
+			r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup})
 
-		//r.msgs = append(r.msgs, msg)
-		r.electionElapsed = 0
-		r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
-		if r.State == StateLeader && r.leadTransferee != None {
-			r.leadTransferee = None
 		}
-		r.Step(msg)
-
-	}
-	r.tickLeaderLeaseCheck()
-	if r.State == StateLeader {
+	case StateLeader:
 		r.heartbeatElapsed++
+		hbrNum := len(r.heartbeatResp)
+		total := len(r.Prs)
+		if r.electionElapsed >= r.randomizedElectionTimeout {
+			if r.debug {
+				log.Infof("Timeout Send MsgHup to [%d]", r.id)
+			}
+			r.electionElapsed = 0
+			r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			r.heartbeatResp = make(map[uint64]bool)
+			r.heartbeatResp[r.id] = true
+			// 心跳回应数不超过一半，说明成为孤岛，重新开始选举
+			if hbrNum*2 <= total {
+				if r.preVote {
+					r.campaign(campaignPreElection)
+				} else {
+					r.campaign(campaignElection)
+				}
+
+			}
+			if r.leadTransferee != None {
+				r.leadTransferee = None
+			}
+			r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup})
+		}
+
 		// Leader对每个peer发送一个heartbeat请求
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
@@ -370,7 +408,7 @@ func (r *Raft) tick() {
 			}
 		}
 	}
-
+	// r.tickLeaderLeaseCheck()
 }
 
 func (r *Raft) tickLeaderLeaseCheck() {
@@ -419,6 +457,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.curTime = 0
+	r.heartbeatResp = make(map[uint64]bool)
+	r.heartbeatResp[r.id] = true
 	// r.PendingConfIndex = 0
 	r.leadTransferee = None
 	if r.Term != term {
@@ -460,6 +500,8 @@ func (r *Raft) becomeCandidate() {
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.curTime = 0
+	r.heartbeatResp = make(map[uint64]bool)
+	r.heartbeatResp[r.id] = true
 	// r.PendingConfIndex = 0
 	r.leadTransferee = None
 	for id := range r.Prs {
@@ -480,6 +522,8 @@ func (r *Raft) becomeLeader() {
 	}
 	r.State = StateLeader
 	r.Lead = r.id
+	r.heartbeatResp = make(map[uint64]bool)
+	r.heartbeatResp[r.id] = true
 	// r.PendingConfIndex = 0
 	r.leadTransferee = None
 	for id := range r.Prs {
@@ -500,7 +544,9 @@ func (r *Raft) becomeLeader() {
 		r.PendingConfIndex = r.RaftLog.LastIndex()
 	}
 	// Leader propose a noop entry
-	log.Infof("[%d] become Leader\n", r.id)
+	if r.debug {
+		log.Infof("[%d] become Leader", r.id)
+	}
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.append(entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
@@ -520,6 +566,9 @@ func (r *Raft) campaign(t CampaignType) {
 		// PreVote RPCs are sent for the next term before we've incremented r.Term.
 		term = r.Term + 1
 	} else {
+		if r.debug {
+			log.Infof("[%d] start campaign", r.id)
+		}
 		r.becomeCandidate()
 		voteMsg = pb.MessageType_MsgRequestVote
 		term = r.Term
@@ -545,7 +594,9 @@ func (r *Raft) campaign(t CampaignType) {
 			if id != r.id {
 				index := r.RaftLog.LastIndex()
 				logTerm, _ := r.RaftLog.Term(index)
-				log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
+				if r.debug {
+					log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
+				}
 				msg := pb.Message{From: r.id, To: id, MsgType: voteMsg, Term: term, Index: index, LogTerm: logTerm}
 				r.msgs = append(r.msgs, msg)
 			}
@@ -588,7 +639,9 @@ func (r *Raft) Step(m pb.Message) error {
 	// if _, ok := r.Prs[m.From]; !ok {
 	// 	return nil
 	// }
-	log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+	if r.debug {
+		log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+	}
 
 	// Your Code Here (2A).
 	if m.Term > r.Term {
@@ -624,10 +677,14 @@ func (r *Raft) Step(m pb.Message) error {
 			r.msgs = append(r.msgs, msg)
 			r.electionElapsed = 0
 			r.Vote = m.From
-			log.Infof("[%d] Votes for [%d]", r.id, m.From)
+			if r.debug {
+				log.Infof("[%d] Votes for [%d]", r.id, m.From)
+			}
 			// r.becomeFollower(m.Term, None)
 		} else {
-			log.Infof("[%d] Reject Vote for [%d]", r.id, m.From)
+			if r.debug {
+				log.Infof("[%d] Reject Vote for [%d]", r.id, m.From)
+			}
 			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Reject: true, Term: r.Term}
 			r.msgs = append(r.msgs, msg)
 		}
@@ -639,14 +696,6 @@ func (r *Raft) Step(m pb.Message) error {
 		// start new election
 		case pb.MessageType_MsgHup:
 			if _, ok := r.Prs[r.id]; !ok {
-				return nil
-			}
-			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
-			if err != nil {
-				log.Panic(err)
-			}
-			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
 			if r.preVote {
@@ -693,10 +742,10 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateCandidate, StatePreCandidate:
 		var myVoteRespType pb.MessageType
 		if r.State == StatePreCandidate {
-			log.Infof("[%d] is PreCandidate,So Receive MsgPreRequestVoteResponse", r.id)
+			// log.Infof("[%d] is PreCandidate,So Receive MsgPreRequestVoteResponse", r.id)
 			myVoteRespType = pb.MessageType_MsgPreRequestVoteResponse
 		} else {
-			log.Infof("[%d] is Candidate,So Receive MsgRequestVoteResponse", r.id)
+			// log.Infof("[%d] is Candidate,So Receive MsgRequestVoteResponse", r.id)
 			myVoteRespType = pb.MessageType_MsgRequestVoteResponse
 		}
 		switch m.MsgType {
@@ -704,14 +753,14 @@ func (r *Raft) Step(m pb.Message) error {
 			if _, ok := r.Prs[r.id]; !ok {
 				return nil
 			}
-			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
-			if err != nil {
-				log.Panic(err)
-			}
-			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
-				return nil
-			}
+			// ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
+			// if err != nil {
+			// 	log.Panic(err)
+			// }
+			// if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+			// 	// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+			// 	return nil
+			// }
 			if r.preVote {
 				r.campaign(campaignPreElection)
 			} else {
@@ -720,7 +769,7 @@ func (r *Raft) Step(m pb.Message) error {
 
 		case myVoteRespType:
 			if !m.Reject {
-				// log.Infof("[%d] Receive VoteResponse Msg from [%d]", r.id, m.From)
+				//log.Infof("[%d] Receive VoteResponse Msg from [%d]", r.id, m.From)
 				r.votes[m.From] = true
 				trueCount := 0
 				// 统计投票的数量
@@ -729,11 +778,9 @@ func (r *Raft) Step(m pb.Message) error {
 						trueCount++
 					}
 				}
-				log.Infof("[%d] get %d votes", r.id, trueCount)
 				if trueCount >= r.quorum() {
 					if r.State == StatePreCandidate {
 						// PreVotes结束，可以正常进行选举
-						log.Infof("[%d] Win PreVote, Start Election", r.id)
 						r.campaign(campaignElection)
 					} else {
 						// 得到超过一半的票，成为leader
@@ -760,9 +807,8 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 			}
 		case pb.MessageType_MsgAppend:
-			if m.Term >= r.Term {
-				r.becomeFollower(m.Term, m.From)
-			}
+			r.becomeFollower(m.Term, m.From)
+			r.handleAppendEntries(m)
 		case pb.MessageType_MsgHeartbeat:
 			r.becomeFollower(m.Term, m.From)
 			r.handleHeartbeat(m)
@@ -789,7 +835,9 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 
 		case pb.MessageType_MsgPropose:
-			// log.Infof("Receive Propose signal!\n")
+			if r.debug {
+				log.Infof("Receive Propose signal!\n")
+			}
 			if _, ok := r.Prs[r.id]; !ok {
 				// 节点被移除集群
 				return nil
@@ -836,7 +884,6 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			// entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
 			r.RaftLog.append(entries...)
-			// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
 			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 			r.maybeCommit()
 			// log.Infof("After Propose, Raftlog Entry Length is %d\n", len(r.RaftLog.entries))
@@ -862,7 +909,9 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
 						// 发送TimeoutNow消息
-						// log.Infof("[%d] Send TimeoutNow Message to [%d]", r.id, m.From)
+						if r.debug {
+							log.Infof("[%d] Send TimeoutNow Message to [%d]", r.id, m.From)
+						}
 						msg := pb.Message{To: m.From, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
 						r.msgs = append(r.msgs, msg)
 					}
@@ -871,26 +920,22 @@ func (r *Raft) Step(m pb.Message) error {
 			} else {
 				// Follower的log length太短, nextIndex = Xlen
 				if m.Xlen < m.Index {
-					// if m.Xlen == 0 {
-					// 	// 如果Xlen为0，那么说明Follower的log是空的，需要从1开始进行append
-					// 	m.Xlen = 1
-					// }
-					log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
+					// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
 					r.Prs[m.From].Next = m.Xlen + 1
 				} else {
 					index := r.RaftLog.FindLastTerm(m.Xterm)
 					if index == 0 {
 						// Leader没有XTerm，nextIndex = Xindex
-						log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
+						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
 						r.Prs[m.From].Next = m.Xindex
 					} else {
 						// Leader有Xterm, nextIndex = leader's last entry for XTerm
-						log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
+						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
 						r.Prs[m.From].Next = index
 					}
 				}
 				// append失败的index,减1继续发送append请求
-				// r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
+				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
@@ -898,6 +943,7 @@ func (r *Raft) Step(m pb.Message) error {
 			pr := r.Prs[m.From]
 			// 更新leader与follower的通信间隔
 			pr.lastCommunicteTs = int64(r.curTime)
+			r.heartbeatResp[m.From] = true
 			if r.Term < m.Term {
 				r.Term = m.Term
 				if r.State != StateFollower {
@@ -930,16 +976,20 @@ func (r *Raft) Step(m pb.Message) error {
 			r.leadTransferee = leadTransferee
 			pr, ok := r.Prs[m.From]
 			if !ok {
-				log.Infof("%x no progress available for %x", r.id, m.From)
+				// log.Infof("%x no progress available for %x", r.id, m.From)
 				return nil
 			}
 			if pr.Match == r.RaftLog.LastIndex() {
 				// 发送TimeoutNow消息
-				// log.Infof("[%d] Raft Send TimeoutNow Message to [%d]", r.id, leadTransferee)
+				if r.debug {
+					log.Infof("[%d] Raft Send TimeoutNow Message to [%d]", r.id, leadTransferee)
+				}
 				msg := pb.Message{To: leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow, From: r.id}
 				r.msgs = append(r.msgs, msg)
 			} else {
-				// log.Infof("Transfer Leader is not Match, [%d] Send Append Message to [%d]", r.id, leadTransferee)
+				if r.debug {
+					log.Infof("Transfer Leader is not Match, [%d] Send Append Message to [%d]", r.id, leadTransferee)
+				}
 				r.sendAppend(leadTransferee)
 			}
 		}
@@ -1028,18 +1078,22 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// 添加日志成功，应答当前的最后索引回去
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: mlastIndex, Term: r.Term}
 		r.msgs = append(r.msgs, msg)
-		log.Infof("[%d] Receive Append from [%d], after Append commited is %d, LastIndex is %d\n", r.id, m.From, r.RaftLog.committed, mlastIndex)
+		if r.debug {
+			log.Infof("[%d] Receive Append from [%d], after Append commited is %d, LastIndex is %d\n", r.id, m.From, r.RaftLog.committed, mlastIndex)
+		}
 		// log.Infof("[%d] Raftlog Entries is %v", r.id, r.RaftLog.unstableEntries())
 	} else {
 		// 添加日志失败
 		term, _ := r.RaftLog.Term(m.Index)
-		log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
-			r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+		if r.debug {
+			log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
+				r.id, term, m.Index, m.LogTerm, m.Index, m.From)
+		}
 		xlen := r.RaftLog.LastIndex()
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
 		// 如果Follower的log length小于nextIndex,那么说明follower's log太短,这里没有冲突的Term
 		if xlen < m.Index {
-			log.Infof("Follower too short, xlen is %d", xlen)
+			// log.Infof("Follower too short, xlen is %d", xlen)
 			msg.Xlen = xlen
 		} else {
 			// 寻找冲突的Term和该Term在Follower's log中的第一个entry index
@@ -1123,10 +1177,15 @@ func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
 	// r.PendingConfIndex = 0
 	if _, ok := r.Prs[id]; ok {
+		if r.debug {
+			log.Infof("[%d] Already have [%d] in Prs", r.id, id)
+		}
 		// 已经在节点列表中
 		return
 	}
-	// log.Infof("[%d] Add Noede [%d]", r.id, id)
+	if r.debug {
+		log.Infof("[%d] Add Noede [%d]", r.id, id)
+	}
 	r.Prs[id] = &Progress{Next: 1, Match: 0}
 	if r.State == StateLeader {
 		r.sendHeartbeat(id)
@@ -1143,7 +1202,9 @@ func (r *Raft) removeNode(id uint64) {
 	if len(r.Prs) == 0 {
 		return
 	}
-	// log.Infof("[%d] Delete Noede [%d]", r.id, id)
+	if r.debug {
+		log.Infof("[%d] Delete Noede [%d]", r.id, id)
+	}
 	// 删除节点后，可能可以进行commit操作
 	if r.State == StateLeader {
 		if len(r.Prs) != 0 {

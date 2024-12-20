@@ -85,6 +85,7 @@ func TestReadWrite(t *testing.T) {
 '
 
 echo "$bench_file" > kv/test_raftstore/bench_test.go
+go clean -testcache
 go test ./kv/test_raftstore/ -run ReadWrite -v > bench.log
 score=$(grep QPS: bench.log | awk '{print $3}')
 rm bench.log

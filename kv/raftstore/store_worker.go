@@ -126,7 +126,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 				return false, nil
 			}
 			meta.pendingVotes = append(meta.pendingVotes, msg)
-			log.Infof("region %d doesn't exist yet, wait for it to be split.", regionID)
+			log.Panicf("region %d doesn't exist yet, wait for it to be split.", regionID)
 			return true, nil
 		}
 		return false, errors.Errorf("region %d not exists but not tombstone: %s", regionID, localState)
@@ -227,7 +227,7 @@ func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (b
 	meta.regions[regionID] = peer.Region()
 	d.ctx.router.register(peer)
 	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeStart})
-	meta.regionRanges.ReplaceOrInsert(&regionItem{region: peer.Region()})
+	// meta.regionRanges.ReplaceOrInsert(&regionItem{region: peer.Region()})
 	return true, nil
 }
 

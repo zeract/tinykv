@@ -116,6 +116,11 @@ func (rn *RawNode) Campaign() error {
 	})
 }
 
+// TimoutNow可以直接进行campaign而无需进行pre-Vote
+func (rn *RawNode) RaftCandidate() {
+	rn.Raft.becomeCandidate()
+}
+
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
 	ent := pb.Entry{Data: data}
