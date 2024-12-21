@@ -291,10 +291,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 	ents, erre := r.RaftLog.Entries(pr.Next)
 	if errt != nil || erre != nil {
 		// 检查follower是否与leader存在通信
-		if !r.checkFollowerActive(to, int64(r.curTime)) {
+		// if !r.checkFollowerActive(to, int64(r.curTime)) {
+		// 	return false
+		// }
+		if !r.heartbeatResp[to] {
 			return false
 		}
-
 		msg.MsgType = pb.MessageType_MsgSnapshot
 		snap, err := r.RaftLog.snapshot()
 		if err != nil {
@@ -333,7 +335,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.LogTerm = term
 		msg.Commit = r.RaftLog.committed
 		// Pipeline 优化？
-		// r.Prs[to].Next = msg.Index + uint64(len(ents)) + 1
+		r.Prs[to].Next = msg.Index + uint64(len(ents)) + 1
 		// log.Printf("The Append entry is %v\n", entry[0])
 	}
 
@@ -385,25 +387,25 @@ func (r *Raft) tick() {
 			r.heartbeatResp[r.id] = true
 			// 心跳回应数不超过一半，说明成为孤岛，重新开始选举
 			if hbrNum*2 <= total {
-				if r.preVote {
-					r.campaign(campaignPreElection)
-				} else {
-					r.campaign(campaignElection)
-				}
-
+				// if r.preVote {
+				// 	r.becomeFollower(r.Term, None)
+				// 	r.campaign(campaignPreElection)
+				// } else {
+				// 	r.campaign(campaignElection)
+				// }
+				r.becomeFollower(r.Term, None)
 			}
 			if r.leadTransferee != None {
 				r.leadTransferee = None
 			}
-			r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup})
 		}
 
 		// Leader对每个peer发送一个heartbeat请求
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
-			for key := range r.Prs {
-				if key != r.id {
-					r.sendHeartbeat(key)
+			for id := range r.Prs {
+				if id != r.id {
+					r.sendHeartbeat(id)
 				}
 			}
 		}
@@ -897,7 +899,8 @@ func (r *Raft) Step(m pb.Message) error {
 			if !m.Reject {
 				pr := r.Prs[m.From]
 				// 更新leader与follower的通信间隔
-				pr.lastCommunicteTs = int64(r.curTime)
+				// pr.lastCommunicteTs = int64(r.curTime)
+				r.heartbeatResp[m.From] = true
 				if pr.maybeUpdate(m.Index) {
 					if r.maybeCommit() {
 						// 更新follower的commited
@@ -935,14 +938,14 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 				}
 				// append失败的index,减1继续发送append请求
-				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
+				// r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
 		case pb.MessageType_MsgHeartbeatResponse:
 			pr := r.Prs[m.From]
 			// 更新leader与follower的通信间隔
-			pr.lastCommunicteTs = int64(r.curTime)
+			// pr.lastCommunicteTs = int64(r.curTime)
 			r.heartbeatResp[m.From] = true
 			if r.Term < m.Term {
 				r.Term = m.Term

@@ -111,8 +111,9 @@ func (rn *RawNode) Tick() {
 
 // Campaign causes this RawNode to transition to candidate state.
 func (rn *RawNode) Campaign() error {
+	// 这里将MsgHup改为MsgTimeoutNow，因为MsgHup会进行pre-Vote
 	return rn.Raft.Step(pb.Message{
-		MsgType: pb.MessageType_MsgHup,
+		MsgType: pb.MessageType_MsgTimeoutNow,
 	})
 }
 
@@ -261,7 +262,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	if !IsEmptySnap(&rd.Snapshot) {
 		// log.Infof("Call Advance, Snap is not empty")
 		rn.Raft.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
-		rn.Raft.RaftLog.maybeCompact()
+		// rn.Raft.RaftLog.maybeCompact()
 	}
 
 }

@@ -142,8 +142,11 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.unstableEntries()) != 0 {
-		return l.stabled + uint64(len(l.unstableEntries()))
+	// if len(l.unstableEntries()) != 0 {
+	// 	return l.stabled + uint64(len(l.unstableEntries()))
+	// }
+	if len(l.entries) != 0 {
+		return l.entries[len(l.entries)-1].Index
 	}
 	// 2C 如果存在snapshot，则返回snapshot的索引
 	if l.pendingSnapshot != nil {
@@ -301,6 +304,9 @@ func (l *RaftLog) FindFirstTerm(term uint64) uint64 {
 	// lst := l.LastIndex()
 	// 从committed之后开始查找Term对应的Entry，因为即使entry是stabled的被持久化在storage中
 	// 但是如果没有被committed，还是可以被修改进行同步
+	if term == 0 {
+		return 0
+	}
 	for _, e := range l.entries {
 		if e.Term == term {
 			return e.Index
@@ -313,7 +319,7 @@ func (l *RaftLog) FindFirstTerm(term uint64) uint64 {
 	// 	}
 	// }
 	// 如果找不到就返回committed的下一个位置
-	panic("Can't Find Entry")
+	// panic("Can't Find Entry")
 	return l.entries[0].Index
 }
 
@@ -495,13 +501,32 @@ func (l *RaftLog) snapshot() (pb.Snapshot, error) {
 
 // 从Snapshot中恢复数据
 func (l *RaftLog) snapRestore(snap pb.Snapshot) {
+
+	// 丢弃之前的所有 entry
+	if len(l.entries) > 0 {
+		if snap.Metadata.Index >= l.LastIndex() {
+			l.entries = nil
+		} else {
+			l.entries = l.entries[snap.Metadata.Index-l.FirstIndex()+1:]
+		}
+	}
 	l.committed = snap.Metadata.Index
 	l.dummyIndex = snap.Metadata.Index
 	l.stabled = snap.Metadata.Index
 	l.applied = snap.Metadata.Index
 	// l.entries = l.entries[:l.stabled-l.dummyIndex]
-	l.entries = nil
+	// l.entries = nil
 	l.pendingSnapshot = &snap
+
+	if l.LastIndex() < snap.Metadata.Index {
+		// 加一个空条目，以指明 lastIndex 和 lastTerm 与快照一致
+		entry := pb.Entry{
+			EntryType: pb.EntryType_EntryNormal,
+			Index:     snap.Metadata.Index,
+			Term:      snap.Metadata.Term,
+		}
+		l.entries = append(l.entries, entry)
+	}
 }
 
 func (l *RaftLog) stableSnapTo(i uint64) {
@@ -513,4 +538,13 @@ func (l *RaftLog) stableSnapTo(i uint64) {
 		// log.Infof("Stable Snap to %d, now Snap is nil", i)
 		l.pendingSnapshot = nil
 	}
+}
+
+// FirstIndex return the first index of the log entries
+func (l *RaftLog) FirstIndex() uint64 {
+	if len(l.entries) == 0 {
+		index, _ := l.storage.FirstIndex()
+		return index
+	}
+	return l.entries[0].Index
 }
