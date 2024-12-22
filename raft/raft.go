@@ -155,15 +155,6 @@ type Raft struct {
 	// log replication progress of each peers
 	Prs map[uint64]*Progress
 
-	// number of ticks since it become leader
-	curTime int
-
-	// Leader Alive Check interval
-	leaderAliveTimeout int
-
-	//  the max time leader communicate with follwers
-	leaderLeaseTimeout int
-
 	// this peer's role
 	State StateType
 
@@ -181,6 +172,12 @@ type Raft struct {
 
 	// Debug Config
 	debug bool
+
+	// SnapShot check
+	haveSendedSnapShot map[uint64]int
+
+	// SnapShotTimeout
+	pendingSnapShotTimeout int
 
 	// 在某一轮心跳中，每个 follower 是否给了 heartbeat 回应，用于应对网络分区
 	// 每一次 electionTimeout ，就重置
@@ -228,6 +225,7 @@ func newRaft(c *Config) *Raft {
 	// Your Code Here (2A).
 	votes := make(map[uint64]bool)
 	Prs := make(map[uint64]*Progress)
+	haveSendedSnapShot := make(map[uint64]int)
 	peers := c.peers
 	if len(cs.Nodes) > 0 {
 		if len(peers) > 0 {
@@ -249,10 +247,10 @@ func newRaft(c *Config) *Raft {
 		Prs:                       Prs,
 		randomizedElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 		RaftLog:                   log,
-		leaderAliveTimeout:        2 * c.ElectionTick,
-		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
 		preVote:                   c.preVote,
 		debug:                     false,
+		pendingSnapShotTimeout:    5 * c.ElectionTick / 10,
+		haveSendedSnapShot:        haveSendedSnapShot,
 	}
 	if hs.Vote != 0 || hs.Term != 0 || hs.Commit != 0 {
 		raft.loadState(hs)
@@ -290,11 +288,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 	ents, erre := r.RaftLog.Entries(pr.Next)
 	if errt != nil || erre != nil {
-		// 检查follower是否与leader存在通信
-		// if !r.checkFollowerActive(to, int64(r.curTime)) {
-		// 	return false
-		// }
-		if !r.heartbeatResp[to] {
+
+		if _, ok := r.haveSendedSnapShot[to]; ok {
+			// 如果已经发送了snapshot，那么就不再发送append消息
 			return false
 		}
 		msg.MsgType = pb.MessageType_MsgSnapshot
@@ -313,6 +309,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 			log.Panicf("Need non-empty snapshot")
 		}
 		msg.Snapshot = &snap
+		// 发送snapshot，添加记录
+		r.haveSendedSnapShot[to] = 1
 		if r.debug {
 			log.Infof("Send Snapshot[%d,%d] from %d to %d", snap.Metadata.Index, snap.Metadata.Term, r.id, to)
 		}
@@ -335,7 +333,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.LogTerm = term
 		msg.Commit = r.RaftLog.committed
 		// Pipeline 优化？
-		r.Prs[to].Next = msg.Index + uint64(len(ents)) + 1
+		// r.Prs[to].Next = msg.Index + uint64(len(ents)) + 1
 		// log.Printf("The Append entry is %v\n", entry[0])
 	}
 
@@ -399,7 +397,13 @@ func (r *Raft) tick() {
 				r.leadTransferee = None
 			}
 		}
-
+		// 遍历r.haveSendedSnapShot，对每个项加1
+		for k, v := range r.haveSendedSnapShot {
+			r.haveSendedSnapShot[k] = v + 1
+			if r.haveSendedSnapShot[k] > r.pendingSnapShotTimeout {
+				delete(r.haveSendedSnapShot, k)
+			}
+		}
 		// Leader对每个peer发送一个heartbeat请求
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
@@ -411,38 +415,6 @@ func (r *Raft) tick() {
 		}
 	}
 	// r.tickLeaderLeaseCheck()
-}
-
-func (r *Raft) tickLeaderLeaseCheck() {
-	if r.State == StateLeader {
-		r.curTime++
-		// 超过leaderAliveTimeout，开始进行检查
-		if r.curTime >= r.leaderAliveTimeout {
-			counts := 1
-			// 检查每个follower与leader上次通信的时间是否超时
-			for id, pr := range r.Prs {
-				if id == r.id {
-					continue
-				}
-				diff := r.curTime - int(pr.lastCommunicteTs)
-				if diff < r.leaderLeaseTimeout {
-					counts++
-				}
-				r.Prs[id].lastCommunicteTs = 0
-			}
-			// 一半以上的follower与leader通信超时
-			if counts < r.quorum() {
-				r.becomeFollower(r.Term, None)
-			}
-			r.curTime = 0
-
-		}
-	}
-}
-
-func (r *Raft) checkFollowerActive(to uint64, curTs int64) bool {
-	interval := curTs - r.Prs[to].lastCommunicteTs
-	return interval < int64(r.leaderLeaseTimeout)
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -458,7 +430,6 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// increment the term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-	r.curTime = 0
 	r.heartbeatResp = make(map[uint64]bool)
 	r.heartbeatResp[r.id] = true
 	// r.PendingConfIndex = 0
@@ -501,7 +472,6 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-	r.curTime = 0
 	r.heartbeatResp = make(map[uint64]bool)
 	r.heartbeatResp[r.id] = true
 	// r.PendingConfIndex = 0
@@ -899,8 +869,9 @@ func (r *Raft) Step(m pb.Message) error {
 			if !m.Reject {
 				pr := r.Prs[m.From]
 				// 更新leader与follower的通信间隔
-				// pr.lastCommunicteTs = int64(r.curTime)
 				r.heartbeatResp[m.From] = true
+				// 删除haveSendedSnapShot记录
+				delete(r.haveSendedSnapShot, m.From)
 				if pr.maybeUpdate(m.Index) {
 					if r.maybeCommit() {
 						// 更新follower的commited
@@ -922,30 +893,29 @@ func (r *Raft) Step(m pb.Message) error {
 
 			} else {
 				// Follower的log length太短, nextIndex = Xlen
-				if m.Xlen < m.Index {
-					// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
-					r.Prs[m.From].Next = m.Xlen + 1
-				} else {
-					index := r.RaftLog.FindLastTerm(m.Xterm)
-					if index == 0 {
-						// Leader没有XTerm，nextIndex = Xindex
-						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
-						r.Prs[m.From].Next = m.Xindex
-					} else {
-						// Leader有Xterm, nextIndex = leader's last entry for XTerm
-						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
-						r.Prs[m.From].Next = index
-					}
-				}
+				// if m.Xlen < m.Index {
+				// 	// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
+				// 	r.Prs[m.From].Next = m.Xlen + 1
+				// } else {
+				// 	index := r.RaftLog.FindLastTerm(m.Xterm)
+				// 	if index == 0 {
+				// 		// Leader没有XTerm，nextIndex = Xindex
+				// 		// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
+				// 		r.Prs[m.From].Next = m.Xindex
+				// 	} else {
+				// 		// Leader有Xterm, nextIndex = leader's last entry for XTerm
+				// 		// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
+				// 		r.Prs[m.From].Next = index
+				// 	}
+				// }
 				// append失败的index,减1继续发送append请求
-				// r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
+				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
 		case pb.MessageType_MsgHeartbeatResponse:
 			pr := r.Prs[m.From]
 			// 更新leader与follower的通信间隔
-			// pr.lastCommunicteTs = int64(r.curTime)
 			r.heartbeatResp[m.From] = true
 			if r.Term < m.Term {
 				r.Term = m.Term
@@ -1092,18 +1062,18 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			log.Infof("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x\n",
 				r.id, term, m.Index, m.LogTerm, m.Index, m.From)
 		}
-		xlen := r.RaftLog.LastIndex()
+		// xlen := r.RaftLog.LastIndex()
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
 		// 如果Follower的log length小于nextIndex,那么说明follower's log太短,这里没有冲突的Term
-		if xlen < m.Index {
-			// log.Infof("Follower too short, xlen is %d", xlen)
-			msg.Xlen = xlen
-		} else {
-			// 寻找冲突的Term和该Term在Follower's log中的第一个entry index
-			xindex := r.RaftLog.FindFirstTerm(term)
-			msg.Xindex = xindex
-			msg.Xterm = term
-		}
+		// if xlen < m.Index {
+		// 	// log.Infof("Follower too short, xlen is %d", xlen)
+		// 	msg.Xlen = xlen
+		// } else {
+		// 	// 寻找冲突的Term和该Term在Follower's log中的第一个entry index
+		// 	xindex := r.RaftLog.FindFirstTerm(term)
+		// 	msg.Xindex = xindex
+		// 	msg.Xterm = term
+		// }
 
 		r.msgs = append(r.msgs, msg)
 	}
