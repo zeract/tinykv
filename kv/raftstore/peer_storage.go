@@ -354,6 +354,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	for i := enLastIndex + 1; i <= psLastIndex; i++ {
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 	}
+	// log.Infof("Storage Update LastIndex to %d", enLastIndex)
 	return err
 }
 
@@ -379,29 +380,21 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 	ps.snapState.StateType = snap.SnapState_Applying
 
-	ps.raftState = &rspb.RaftLocalState{
-		HardState: &eraftpb.HardState{
-			Term:   snapshot.Metadata.Term,
-			Vote:   ps.raftState.HardState.Vote,
-			Commit: snapshot.Metadata.Index,
-		},
-		LastIndex: snapshot.Metadata.Index,
-		LastTerm:  snapshot.Metadata.Term,
-	}
-	ps.applyState = &rspb.RaftApplyState{
-		AppliedIndex: snapshot.Metadata.Index,
-		TruncatedState: &rspb.RaftTruncatedState{
-			Index: snapshot.Metadata.Index,
-			Term:  snapshot.Metadata.Term,
-		},
-	}
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+
 	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.GetRegion().GetId()), ps.applyState); err != nil {
-		return nil, err
-	}
-	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.GetRegion().GetId()), ps.raftState); err != nil {
+		log.Panic(err)
 		return nil, err
 	}
 	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.GetRegion().GetId()), ps.raftState); err != nil {
+		log.Panic(err)
+		return nil, err
+	}
 
 	ch := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
@@ -438,25 +431,45 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		}
 
 	}
+	changed := false
 	// 对raft log进行持久化操作
 	err := ps.Append(ready.Entries, raftWB)
+	if err != nil {
+		panic(err)
+	}
+	if raftWB.Len() > 0 {
+		changed = changed || true
+	}
 	// 更新 raftState
 	if len(ready.Entries) != 0 {
 		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
 		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
 		if newLastIndex > ps.raftState.LastIndex {
+			changed = changed || true
 			ps.raftState.LastIndex = newLastIndex
 			ps.raftState.LastTerm = newLastTerm
+			// log.Infof("Write Entries to DB, RaftState last index is %d", ps.raftState.LastIndex)
 		}
 	}
 	if !raft.IsEmptyHardState(ready.HardState) {
+		changed = changed || true
 		ps.raftState.HardState = &ready.HardState
 	}
-	// 新状态
-	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-	// 写
-	err = raftWB.WriteToDB(ps.Engines.Raft)
-	err = kvWB.WriteToDB(ps.Engines.Kv)
+	if changed {
+		// 新状态
+		err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+		if err != nil {
+			panic(err)
+		}
+		// 写
+		err = raftWB.WriteToDB(ps.Engines.Raft)
+		if err != nil {
+			panic(err)
+		}
+	}
+	if kvWB.Len() != 0 {
+		err = kvWB.WriteToDB(ps.Engines.Kv)
+	}
 	return snap, err
 }
 

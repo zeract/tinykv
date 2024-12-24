@@ -70,12 +70,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if len(ready.CommittedEntries) > 0 {
 			// 对所有Cmmitted的Entries进行处理
 			for _, entry := range ready.CommittedEntries {
-				// 更新PeerStorage的AppliedIndex
-				d.peerStorage.applyState.AppliedIndex = entry.Index
 				if entry.Data == nil {
 					continue
 				}
 				wb := new(engine_util.WriteBatch)
+				changed := true
 				// 遍历所有的committed Entries，如果是Normal request则继续进行处理
 				if entry.EntryType == eraftpb.EntryType_EntryNormal {
 					// 从Entry中取出对应的RaftCmdRequest，其中包含多个Requests
@@ -90,34 +89,36 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 					} else if len(requests.Requests) > 0 {
 						// 将requests中的数据进行apply
-						d.applyNormalRequests(requests, entry, wb)
+						changed = d.applyNormalRequests(requests, entry, wb)
 					}
 				} else {
 					d.applyConfChangeRequest(&entry, wb)
 				}
-
 				if d.stopped {
-					// WB := &engine_util.WriteBatch{}
-					// WB.DeleteMeta(meta.ApplyStateKey(d.regionId))
-					// err = WB.WriteToDB(d.peerStorage.Engines.Kv)
-					// if err != nil {
-					// 	panic(err)
-					// }
+					WB := &engine_util.WriteBatch{}
+					WB.DeleteMeta(meta.ApplyStateKey(d.regionId))
+					err = WB.WriteToDB(d.peerStorage.Engines.Kv)
+					if err != nil {
+						panic(err)
+					}
 					return
 				}
-				// 将更新的ApplyState写入KV DB
-				err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-				if err != nil {
-					panic(err)
+				// 更新PeerStorage的AppliedIndex
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+				// 如果没有数据变化，则不需要写入KV DB，但是如果遍历到最后一个commmited Entry，那么就需要将更新的AppliedIndex写入DB
+				if changed {
+					// 将更新的ApplyState写入KV DB
+					err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					if err != nil {
+						panic(err)
+					}
+					wb.MustWriteToDB(d.peerStorage.Engines.Kv)
 				}
-				wb.MustWriteToDB(d.peerStorage.Engines.Kv)
-
 				engines := d.peerStorage.Engines
 				txn := engines.Kv.NewTransaction(false)
 				regionId := d.peerStorage.Region().GetId()
 				regionState := new(rspb.RegionLocalState)
 				err = engine_util.GetMetaFromTxn(txn, meta.RegionStateKey(regionId), regionState)
-
 				if err != nil {
 					log.Panic(err)
 				}
@@ -223,11 +224,9 @@ func (d *peerMsgHandler) execSplit(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmd
 	if p != nil {
 		p.cb.Done(resp)
 	}
-	if d.IsLeader() {
-		// 刷新 scheduler 的 region 缓存
-		d.notifyHeartbeatScheduler(d.Region(), d.peer)
-		d.notifyHeartbeatScheduler(newRegion, newPeer)
-	}
+	// 刷新 scheduler 的 region 缓存
+	d.notifyHeartbeatScheduler(d.Region(), d.peer)
+	d.notifyHeartbeatScheduler(newRegion, newPeer)
 	// PendingVotes优化, 使新peer能够及时选举
 	// d.PendingVotes(newPeer, newRegion)
 
@@ -345,12 +344,13 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: []*raft_cmdpb.Response{},
 	}
-	changed := true
+	changed := false
 	for _, request := range requests.Requests {
 		if request.GetCmdType() != raft_cmdpb.CmdType_Invalid {
 			t := request.GetCmdType()
 			// 判断是读请求还是写请求
 			if t == raft_cmdpb.CmdType_Delete || t == raft_cmdpb.CmdType_Put {
+				changed = true || changed
 				if t == raft_cmdpb.CmdType_Delete {
 					// Delete Request，需要执行Delete操作
 					cf := request.GetDelete().GetCf()
@@ -370,7 +370,7 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 				}
 
 			} else {
-				changed = false
+				changed = false || changed
 				// 读取请求
 				if t == raft_cmdpb.CmdType_Get {
 					// Get Request, 需要执行Get操作
@@ -381,7 +381,7 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 						if p != nil {
 							p.cb.Done(ErrResp(err))
 						}
-						return false
+						return changed
 					}
 					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get,
 						Get: &raft_cmdpb.GetResponse{Value: val}})
@@ -470,41 +470,37 @@ func (d *peerMsgHandler) PendingVotes(newPeer *peer, newRegion *metapb.Region) {
 	if d.IsLeader() {
 		// 触发新peer的选举
 		// peer.RaftGroup.Campaign()
-		newPeer.RaftGroup.RaftCandidate()
 		msgs := make([]eraftpb.Message, 0)
 		index := newPeer.RaftGroup.Raft.RaftLog.LastIndex()
+		if index != 5 {
+			return
+		}
 		term, _ := newPeer.RaftGroup.Raft.RaftLog.Term(index)
+		msg := eraftpb.Message{
+			MsgType: eraftpb.MessageType_MsgRequestVote,
+			From:    newPeer.Meta.Id,
+			Term:    newPeer.Term() + 1,
+			Index:   index,
+			LogTerm: term,
+		}
 		for _, p := range newRegion.Peers {
 			if p.Id == newPeer.Meta.Id {
 				continue
 			}
+			msg.To = p.Id
 			// 向其他store中的peer发送RequestVote请求
-			msgs = append(msgs, eraftpb.Message{
-				MsgType: eraftpb.MessageType_MsgRequestVote,
-				To:      p.Id,
-				From:    newPeer.Meta.Id,
-				Term:    newPeer.Term(),
-				Index:   index,
-				LogTerm: term,
-			})
+			msgs = append(msgs, msg)
 		}
 		// 使用新的peer来进行发送，此时的region也是新建的
 		newPeerMsgHandler(newPeer, d.ctx).Send(d.ctx.trans, msgs)
-		// d.Send(d.ctx.trans, msgs)
+		newPeer.RaftGroup.RaftCandidate()
 	} else {
 		if len(d.ctx.storeMeta.pendingVotes) != 0 {
-			// vote := new(rspb.RaftMessage)
-			d.ctx.storeMeta.RWMutex.Lock()
-			votes := make([]*rspb.RaftMessage, len(d.ctx.storeMeta.pendingVotes))
-			copy(votes, d.ctx.storeMeta.pendingVotes) // 复制出 votes
-			// var vote = d.ctx.storeMeta.pendingVotes[0]
-			// 清空pendingVotes
-			d.ctx.storeMeta.pendingVotes = d.ctx.storeMeta.pendingVotes[:0]
-			d.ctx.storeMeta.RWMutex.Unlock()
-			for _, v := range votes {
-				// log.Errorf("Send Follower Vote Message")
-				newPeer.RaftGroup.Step(*v.Message)
+			err := newPeer.RaftGroup.Step(*d.ctx.storeMeta.pendingVotes[0].Message)
+			if err != nil {
+				panic(err)
 			}
+			d.ctx.storeMeta.pendingVotes = d.ctx.storeMeta.pendingVotes[:0]
 
 		}
 	}
@@ -515,12 +511,14 @@ func (d *peerMsgHandler) FindProposal(index, term uint64) *proposal {
 	for len(d.proposals) > 0 {
 		// 获取第一个proposal
 		p := d.proposals[0]
-		// 将获取的proposal从列表中去除
-		d.proposals = d.proposals[1:]
 		// 判断按序获取的proposal是否与需要的index和term匹配，如果不匹配则标记为stale
 		if p.index < index {
 			NotifyStaleReq(d.Term(), p.cb)
+			// 将获取的proposal从列表中去除
+			d.proposals = d.proposals[1:]
 		} else if p.index == index {
+			// 将获取的proposal从列表中去除
+			d.proposals = d.proposals[1:]
 			if p.term != term {
 				NotifyStaleReq(d.Term(), p.cb)
 			} else {

@@ -82,10 +82,13 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	stores := make([]*core.StoreInfo, 0)
 	all_stores := cluster.GetStores()
 	for _, s := range all_stores {
-		if s.DownTime() < cluster.GetMaxStoreDownTime() {
+		if s.IsUp() && s.DownTime() <= cluster.GetMaxStoreDownTime() {
 			stores = append(stores, s)
-			s.GetAvailable()
+			// s.GetAvailable()
 		}
+	}
+	if len(stores) == 1 || len(stores) == 0 {
+		return nil
 	}
 	// 按 GetAvailable() 返回值排序
 	sort.Slice(stores, func(i, j int) bool {
@@ -114,10 +117,22 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 			break
 		}
 	}
+	if regionInfo == nil {
+		return nil
+	}
 	if len(regionInfo.GetStoreIds()) < cluster.GetMaxReplicas() {
 		return nil
 	}
-	target = findSmallestStore(stores, cluster.GetRegionStores(regionInfo))
+	for i := len(stores) - 1; i >= 0; i-- {
+		suitStore := stores[i]
+		exist := regionInfo.GetStorePeer(suitStore.GetID())
+		if exist == nil {
+			target = suitStore
+			break
+		}
+	}
+
+	// target = findSmallestStore(stores, cluster.GetRegionStores(regionInfo))
 	if target == nil {
 		return nil
 	}

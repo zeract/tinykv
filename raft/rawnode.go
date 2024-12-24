@@ -113,7 +113,7 @@ func (rn *RawNode) Tick() {
 func (rn *RawNode) Campaign() error {
 	// 这里将MsgHup改为MsgTimeoutNow，因为MsgHup会进行pre-Vote
 	return rn.Raft.Step(pb.Message{
-		MsgType: pb.MessageType_MsgTimeoutNow,
+		MsgType: pb.MessageType_MsgHup,
 	})
 }
 
@@ -234,7 +234,7 @@ func (rn *RawNode) HasReady() bool {
 		// log.Infof("Snapshot is not empty, Has Ready data")
 		return true
 	}
-	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || r.RaftLog.hasNextEnts() {
+	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || len(r.RaftLog.nextEnts()) > 0 {
 		return true
 	}
 
@@ -252,8 +252,12 @@ func (rn *RawNode) Advance(rd Ready) {
 	if !IsEmptyHardState(rd.HardState) {
 		rn.prevHardSt = rd.HardState
 	}
-	if rn.prevHardSt.Commit != 0 {
-		rn.Raft.RaftLog.appliedTo(rn.prevHardSt.Commit)
+	// if rn.prevHardSt.Commit != 0 {
+	// 	rn.Raft.RaftLog.appliedTo(rn.prevHardSt.Commit)
+	// }
+	// apply 完毕
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.appliedTo(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
 	}
 	if len(rd.Entries) > 0 {
 		e := rd.Entries[len(rd.Entries)-1]
@@ -264,6 +268,8 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
 		// rn.Raft.RaftLog.maybeCompact()
 	}
+	rn.Raft.msgs = nil
+	rn.Raft.RaftLog.maybeCompact()
 
 }
 
