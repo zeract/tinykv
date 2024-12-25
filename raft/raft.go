@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"math/rand"
 	"sort"
@@ -263,7 +264,7 @@ func newRaft(c *Config) *Raft {
 		preVote:                   c.preVote,
 		checkQuorum:               c.checkQuorum,
 		debug:                     false,
-		pendingSnapShotTimeout:    1 * c.ElectionTick / 10,
+		pendingSnapShotTimeout:    4 * c.ElectionTick / 10,
 		leaderAliveTimeout:        2 * c.ElectionTick,
 		leaderLeaseTimeout:        9 * c.ElectionTick / 10,
 		haveSendedSnapShot:        haveSendedSnapShot,
@@ -392,14 +393,14 @@ func (r *Raft) tick() {
 	case StateLeader:
 		r.heartbeatElapsed++
 		r.curTime++
+		hbrNum := len(r.heartbeatResp)
+		total := len(r.Prs)
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
 			r.heartbeatResp = make(map[uint64]bool)
 			r.heartbeatResp[r.id] = true
 			// 心跳回应数不超过一半，说明成为孤岛，重新开始选举
 			if r.checkQuorum {
-				hbrNum := len(r.heartbeatResp)
-				total := len(r.Prs)
 				if hbrNum*2 <= total {
 					r.becomeFollower(r.Term, None)
 					return
@@ -658,12 +659,12 @@ func (r *Raft) Step(m pb.Message) error {
 		// 	r.id, r.Term, m.MsgType, m.From, m.Term)
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
 		if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
-			// force := bytes.Equal(m.Context, []byte(campaignTransfer))
-			// inLease := r.checkQuorum && r.Lead != None && r.electionElapsed < r.electionTimeout
-			// if !force && inLease {
-			// 	// 当前leader的lease还没有过期，不允许新的leader产生
-			// 	return nil
-			// }
+			force := bytes.Equal(m.Context, []byte(campaignTransfer))
+			inLease := r.checkQuorum && r.Lead != None && r.electionElapsed < r.electionTimeout
+			if !force && inLease {
+				// 当前leader的lease还没有过期，不允许新的leader产生
+				return nil
+			}
 		}
 		switch {
 		case m.MsgType == pb.MessageType_MsgPreRequestVote:
@@ -1095,16 +1096,16 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if r.State != StateFollower {
 			r.becomeFollower(m.Term, None)
 		}
+	} else {
+		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
+		r.msgs = append(r.msgs, msg)
+		return
 	}
 
 	if r.State == StateLeader {
 		return
 	}
-	if m.Term < r.Term {
-		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
-		r.msgs = append(r.msgs, msg)
-		return
-	}
+
 	if m.Index < r.RaftLog.committed {
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed, Term: r.Term}
 		r.msgs = append(r.msgs, msg)
