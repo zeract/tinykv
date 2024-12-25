@@ -82,6 +82,7 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	}
 	// 设置prevote为true
 	config.preVote = true
+	config.checkQuorum = true
 	r := newRaft(config)
 	rn := &RawNode{
 		Raft: r,

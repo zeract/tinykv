@@ -530,19 +530,7 @@ func (l *RaftLog) snapRestore(snap pb.Snapshot) {
 	l.dummyIndex = snap.Metadata.Index
 	l.stabled = snap.Metadata.Index
 	l.applied = snap.Metadata.Index
-	// l.entries = l.entries[:l.stabled-l.dummyIndex]
-	// l.entries = nil
 	l.pendingSnapshot = &snap
-
-	// if l.LastIndex() < snap.Metadata.Index {
-	// 	// 加一个空条目，以指明 lastIndex 和 lastTerm 与快照一致
-	// 	entry := pb.Entry{
-	// 		EntryType: pb.EntryType_EntryNormal,
-	// 		Index:     snap.Metadata.Index,
-	// 		Term:      snap.Metadata.Term,
-	// 	}
-	// 	l.entries = append(l.entries, entry)
-	// }
 }
 
 func (l *RaftLog) stableSnapTo(i uint64) {

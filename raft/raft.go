@@ -112,6 +112,8 @@ type Config struct {
 
 	// PreVote Flag
 	preVote bool
+	// checkQuorum Flag
+	checkQuorum bool
 }
 
 func (c *Config) validate() error {
@@ -169,6 +171,8 @@ type Raft struct {
 
 	// PreVote Config
 	preVote bool
+	// CheckQuorum Config
+	checkQuorum bool
 
 	// Debug Config
 	debug bool
@@ -257,6 +261,7 @@ func newRaft(c *Config) *Raft {
 		randomizedElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 		RaftLog:                   log,
 		preVote:                   c.preVote,
+		checkQuorum:               c.checkQuorum,
 		debug:                     false,
 		pendingSnapShotTimeout:    1 * c.ElectionTick / 10,
 		leaderAliveTimeout:        2 * c.ElectionTick,
@@ -381,32 +386,24 @@ func (r *Raft) tick() {
 				log.Infof("Timeout Send MsgHup to [%d]", r.id)
 			}
 			r.electionElapsed = 0
-			r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 			r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup})
 
 		}
 	case StateLeader:
 		r.heartbeatElapsed++
 		r.curTime++
-		hbrNum := len(r.heartbeatResp)
-		total := len(r.Prs)
-		if r.electionElapsed >= r.randomizedElectionTimeout {
-			if r.debug {
-				log.Infof("Timeout Send MsgHup to [%d]", r.id)
-			}
+		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
-			r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 			r.heartbeatResp = make(map[uint64]bool)
 			r.heartbeatResp[r.id] = true
 			// 心跳回应数不超过一半，说明成为孤岛，重新开始选举
-			if hbrNum*2 <= total {
-				r.becomeFollower(r.Term, None)
-				if r.preVote {
-					r.campaign(campaignPreElection)
-				} else {
-					r.campaign(campaignElection)
+			if r.checkQuorum {
+				hbrNum := len(r.heartbeatResp)
+				total := len(r.Prs)
+				if hbrNum*2 <= total {
+					r.becomeFollower(r.Term, None)
+					return
 				}
-				return
 			}
 			if r.leadTransferee != None {
 				r.leadTransferee = None
@@ -459,6 +456,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// increment the term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	r.curTime = 0
 	r.heartbeatResp = make(map[uint64]bool)
 	r.heartbeatResp[r.id] = true
@@ -487,6 +485,8 @@ func (r *Raft) becomePreCandidate() {
 	}
 	// change State to PreCandidate
 	r.State = StatePreCandidate
+	r.votes = make(map[uint64]bool)
+	r.Lead = None
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -502,6 +502,7 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	r.curTime = 0
 	r.heartbeatResp = make(map[uint64]bool)
 	r.heartbeatResp[r.id] = true
@@ -530,6 +531,7 @@ func (r *Raft) becomeLeader() {
 	// r.PendingConfIndex = 0
 	r.curTime = 0
 	r.leadTransferee = None
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	for id := range r.Prs {
 		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 		if id == r.id {
@@ -552,6 +554,12 @@ func (r *Raft) becomeLeader() {
 }
 
 func (r *Raft) campaign(t CampaignType) {
+	if r.State == StateLeader {
+		return
+	}
+	if _, ok := r.Prs[r.id]; !ok || r.RaftLog.pendingSnapshot != nil {
+		return
+	}
 	var term uint64
 	var voteMsg pb.MessageType
 	if t == campaignPreElection {
@@ -591,7 +599,12 @@ func (r *Raft) campaign(t CampaignType) {
 				if r.debug {
 					log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
 				}
-				msg := pb.Message{From: r.id, To: id, MsgType: voteMsg, Term: term, Index: index, LogTerm: logTerm}
+				// 如果是TransfterLeader，则携带对应的Context
+				var ctx []byte
+				if t == campaignTransfer {
+					ctx = []byte(t)
+				}
+				msg := pb.Message{From: r.id, To: id, MsgType: voteMsg, Term: term, Index: index, LogTerm: logTerm, Context: ctx}
 				r.msgs = append(r.msgs, msg)
 			}
 
@@ -638,37 +651,76 @@ func (r *Raft) Step(m pb.Message) error {
 	}
 
 	// Your Code Here (2A).
-	if m.Term > r.Term {
-		lead := m.From
+	switch {
+	case m.Term == 0:
+	case m.Term > r.Term:
 		// log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
 		// 	r.id, r.Term, m.MsgType, m.From, m.Term)
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
-		if m.MsgType == pb.MessageType_MsgRequestVote {
-			lead = None
+		if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
+			// force := bytes.Equal(m.Context, []byte(campaignTransfer))
+			// inLease := r.checkQuorum && r.Lead != None && r.electionElapsed < r.electionTimeout
+			// if !force && inLease {
+			// 	// 当前leader的lease还没有过期，不允许新的leader产生
+			// 	return nil
+			// }
 		}
 		switch {
 		case m.MsgType == pb.MessageType_MsgPreRequestVote:
 		case m.MsgType == pb.MessageType_MsgPreRequestVoteResponse && !m.Reject:
 		default:
-			r.becomeFollower(m.Term, lead)
-		}
+			if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
+				r.becomeFollower(m.Term, m.From)
+			} else {
+				r.becomeFollower(m.Term, None)
+			}
 
-	}
-	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
-		// if r.Term < m.Term {
-		// 	r.Vote = None
-		// 	r.Term = m.Term
-		// 	if r.State != StateFollower {
-		// 		r.becomeFollower(r.Term, None)
-		// 	}
-		// }
-		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
-		CanVote := m.Term > r.Term || r.Vote == None || r.Vote == m.From
-		if CanVote && r.isUpToDate(entry) {
-			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Term: r.Term}
+		}
+	case m.Term < r.Term:
+		if (r.checkQuorum || r.preVote) && (m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend) {
+			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Term: r.Term}
 			r.msgs = append(r.msgs, msg)
-			r.electionElapsed = 0
-			r.Vote = m.From
+		} else if m.MsgType == pb.MessageType_MsgPreRequestVote {
+			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgPreRequestVoteResponse, Term: r.Term, Reject: true}
+			r.msgs = append(r.msgs, msg)
+		} else {
+			// log.Infof("%x [term: %d] ignored a %s message with lower term from %x [term: %d]",
+			// 	r.id, r.Term, m.MsgType, m.From, m.Term)
+		}
+		return nil
+	}
+	// if m.Term > r.Term {
+	// 	lead := m.From
+	// 	// log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
+	// 	// 	r.id, r.Term, m.MsgType, m.From, m.Term)
+	// 	// 如果是MessageType_MsgRequestVote请求，则将lead置为None
+	// 	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
+	// 		force := bytes.Equal(m.Context, []byte(campaignTransfer))
+	// 		inLease := r.Lead != None && r.electionElapsed < r.electionTimeout
+	// 		if !force && inLease {
+	// 			// 当前leader的lease还没有过期，不允许新的leader产生
+	// 			return nil
+	// 		}
+	// 		lead = None
+	// 	}
+	// 	switch {
+	// 	case m.MsgType == pb.MessageType_MsgPreRequestVote:
+	// 	case m.MsgType == pb.MessageType_MsgPreRequestVoteResponse && !m.Reject:
+	// 	default:
+	// 		r.becomeFollower(m.Term, lead)
+	// 	}
+
+	// }
+	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
+		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
+		CanVote := (m.MsgType == pb.MessageType_MsgPreRequestVote && m.Term > r.Term) || (r.Vote == None && r.Lead == None) || r.Vote == m.From
+		if CanVote && r.isUpToDate(entry) {
+			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Term: m.Term}
+			r.msgs = append(r.msgs, msg)
+			if m.MsgType == pb.MessageType_MsgRequestVote {
+				r.electionElapsed = 0
+				r.Vote = m.From
+			}
 			if r.debug {
 				log.Infof("[%d] Votes for [%d]", r.id, m.From)
 			}
@@ -719,7 +771,7 @@ func (r *Raft) Step(m pb.Message) error {
 				// // MsgHup是一个local message，不能添加到r.msgs中
 				// r.Step(msg)
 				// 发起选举
-				r.campaign(campaignElection)
+				r.campaign(campaignTransfer)
 			}
 
 		case pb.MessageType_MsgTransferLeader:
@@ -745,14 +797,6 @@ func (r *Raft) Step(m pb.Message) error {
 			if _, ok := r.Prs[r.id]; !ok {
 				return nil
 			}
-			// ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
-			// if err != nil {
-			// 	log.Panic(err)
-			// }
-			// if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-			// 	// log.Infof("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
-			// 	return nil
-			// }
 			if r.preVote {
 				r.campaign(campaignPreElection)
 			} else {
@@ -779,7 +823,6 @@ func (r *Raft) Step(m pb.Message) error {
 						r.becomeLeader()
 						for id := range r.Prs {
 							if id != r.id {
-								// r.sendNoopEntry(id)
 								r.sendAppend(id)
 							}
 						}
@@ -795,7 +838,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 				}
 				if falseCount >= r.quorum() {
-					r.becomeFollower(m.Term, None)
+					r.becomeFollower(r.Term, None)
 				}
 			}
 		case pb.MessageType_MsgAppend:
@@ -1052,7 +1095,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if r.State != StateFollower {
 			r.becomeFollower(m.Term, None)
 		}
-	} else {
+	}
+
+	if r.State == StateLeader {
+		return
+	}
+	if m.Term < r.Term {
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
 		r.msgs = append(r.msgs, msg)
 		return

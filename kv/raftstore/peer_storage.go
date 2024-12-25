@@ -122,6 +122,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if len(buf) == int(high-low) {
 		return buf, nil
 	}
+	log.Errorf("%s missing entries, low: %d, high: %d, get %d entries", ps.Tag, low, high, len(buf))
 	// Here means we don't fetch enough entries.
 	return nil, raft.ErrUnavailable
 }
@@ -308,27 +309,6 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
-	// append the entries
-	// if len(entries) != 0 {
-	// 	for _, entry := range entries {
-	// 		err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
-	// 		if err != nil {
-	// 			return err
-	// 		}
-	// 		// log.Infof("Append Entry with index %d", entry.Index)
-	// 	}
-	// 	state := ps.raftState
-	// 	state.LastIndex = entries[len(entries)-1].Index
-	// 	state.LastTerm = entries[len(entries)-1].Term
-	// 	state.HardState.Term = state.LastTerm
-	// 	ps.raftState = state
-	// 	prevLastIndex, _ := ps.LastIndex()
-	// 	for i := state.LastIndex + 1; i <= prevLastIndex; i++ {
-	// 		key := meta.RaftLogKey(ps.region.Id, i)
-	// 		raftWB.DeleteMeta(key)
-	// 	}
-	// 	raftWB.MustWriteToDB(ps.Engines.Raft)
-	// }
 
 	if len(entries) == 0 {
 		return nil
@@ -354,6 +334,9 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	for i := enLastIndex + 1; i <= psLastIndex; i++ {
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 	}
+	// Update RaftState
+	ps.raftState.LastIndex = enLastIndex
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	// log.Infof("Storage Update LastIndex to %d", enLastIndex)
 	return err
 }
@@ -440,20 +423,13 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if raftWB.Len() > 0 {
 		changed = changed || true
 	}
-	// 更新 raftState
-	if len(ready.Entries) != 0 {
-		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
-		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
-		if newLastIndex > ps.raftState.LastIndex {
-			changed = changed || true
-			ps.raftState.LastIndex = newLastIndex
-			ps.raftState.LastTerm = newLastTerm
-			// log.Infof("Write Entries to DB, RaftState last index is %d", ps.raftState.LastIndex)
-		}
-	}
+
 	if !raft.IsEmptyHardState(ready.HardState) {
-		changed = changed || true
-		ps.raftState.HardState = &ready.HardState
+		needUpdate := ps.raftState.HardState.Commit == ready.HardState.Commit && ps.raftState.HardState.Term == ready.HardState.Term && ps.raftState.HardState.Vote == ready.HardState.Vote
+		if !needUpdate {
+			changed = changed || true
+			ps.raftState.HardState = &ready.HardState
+		}
 	}
 	if changed {
 		// 新状态
@@ -466,6 +442,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		if err != nil {
 			panic(err)
 		}
+		// log.Infof("Storage %s Write LastIndex %d to DB", ps.Tag, ps.raftState.LastIndex)
 	}
 	if kvWB.Len() != 0 {
 		err = kvWB.WriteToDB(ps.Engines.Kv)

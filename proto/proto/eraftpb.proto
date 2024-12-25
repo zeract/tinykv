@@ -86,6 +86,7 @@ message Message {
     uint64 xterm = 11;
     uint64 xindex = 12;
     uint64 xlen = 13;
+    bytes context = 14;
 }
 
 // HardState contains the state of a node need to be peristed, including the current term, commit index 
