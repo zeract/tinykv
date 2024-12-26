@@ -83,14 +83,17 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					if err != nil {
 						panic(err)
 					}
+					p := d.FindProposal(entry.Index, entry.Term)
+					d.ScheduleApplyLog(&entry, requests, p)
 					// 创建这个RaftCmdRequest对应的WriteBatch
-					if requests.AdminRequest != nil {
-						d.applyAdminRequests(requests, entry, wb)
+					// if requests.AdminRequest != nil {
+					// 	d.applyAdminRequests(requests, entry, wb)
 
-					} else if len(requests.Requests) > 0 {
-						// 将requests中的数据进行apply
-						changed = d.applyNormalRequests(requests, entry, wb)
-					}
+					// } else if len(requests.Requests) > 0 {
+					// 	// 将requests中的数据进行apply
+					// 	changed = d.applyNormalRequests(requests, entry, wb)
+					// }
+					changed = false
 				} else {
 					d.applyConfChangeRequest(&entry, wb)
 				}
@@ -103,10 +106,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					}
 					return
 				}
-				// 更新PeerStorage的AppliedIndex
-				d.peerStorage.applyState.AppliedIndex = entry.Index
 				// 如果没有数据变化，则不需要写入KV DB，但是如果遍历到最后一个commmited Entry，那么就需要将更新的AppliedIndex写入DB
 				if changed {
+					// 更新PeerStorage的AppliedIndex
+					d.peerStorage.applyState.AppliedIndex = entry.Index
 					// 将更新的ApplyState写入KV DB
 					err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					if err != nil {
@@ -129,8 +132,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 }
 
-func (d *peerMsgHandler) execSplit(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch) {
-	p := d.FindProposal(entry.Index, entry.Term)
+func (d *peerMsgHandler) execSplit(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
+	// p := d.FindProposal(entry.Index, entry.Term)
 	if msg.Header.RegionId != d.regionId {
 		resp := ErrResp(&util.ErrRegionNotFound{RegionId: msg.Header.RegionId})
 		if p != nil {
@@ -330,8 +333,8 @@ func (d *peerMsgHandler) applyConfChangeRequest(entry *eraftpb.Entry, wb *engine
 	d.notifyHeartbeatScheduler(region, d.peer)
 }
 
-func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) bool {
-	p := d.FindProposal(entry.Index, entry.Term)
+func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch, p *proposal) bool {
+	// p := d.FindProposal(entry.Index, entry.Term)
 	err := util.CheckRegionEpoch(requests, d.Region(), true)
 	if err != nil {
 		if p != nil {
@@ -409,8 +412,8 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 	return changed
 }
 
-func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch) {
-	p := d.FindProposal(entry.Index, entry.Term)
+func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
+	// p := d.FindProposal(entry.Index, entry.Term)
 	compactLog := req.GetCompactLog()
 	compactIndex := compactLog.CompactIndex
 	compactTerm := compactLog.CompactTerm
@@ -439,7 +442,7 @@ func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.Ad
 	}
 }
 
-func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch, p *proposal) {
 	// 判断 RegionEpoch
 	if requests.Header != nil {
 		fromEpoch := requests.GetHeader().GetRegionEpoch()
@@ -458,10 +461,10 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 	switch requests.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
 		// 执行Compactlog操作
-		d.execCompactLog(&entry, requests.AdminRequest, wb)
+		d.execCompactLog(&entry, requests.AdminRequest, wb, p)
 	case raft_cmdpb.AdminCmdType_Split:
 		// 执行Split操作
-		d.execSplit(&entry, requests, requests.AdminRequest, wb)
+		d.execSplit(&entry, requests, requests.AdminRequest, wb, p)
 	}
 	return
 }
@@ -760,6 +763,17 @@ func (d *peerMsgHandler) startTicker() {
 func (d *peerMsgHandler) onRaftBaseTick() {
 	d.RaftGroup.Tick()
 	d.ticker.schedule(PeerTickRaft)
+}
+
+// 发送异步apply请求
+func (d *peerMsgHandler) ScheduleApplyLog(entry *eraftpb.Entry, request *raft_cmdpb.RaftCmdRequest, proposal *proposal) {
+	applyLogTask := &ApplyTask{
+		peermsghandler: d,
+		entry:          entry,
+		request:        request,
+		proposal:       proposal,
+	}
+	d.ctx.applyWorkerSender <- applyLogTask
 }
 
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
