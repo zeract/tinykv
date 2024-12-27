@@ -4,12 +4,15 @@
 pass_count=0
 fail_count=0
 
+# 创建输出目录
+mkdir -p ./out
+
 # 循环执行5次
 for ((i=1; i<=20; i++)); 
 do 
     echo "ROUND $i"
     rm -rf /tmp/*test-raftstore*
-    LOG_LEVEL=fatal GO111MODULE=on go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run ^TestConfChangeSnapshotUnreliableRecoverConcurrentPartition3B$ > ./out/out-$i.txt
+    LOG_LEVEL=debug GO111MODULE=on go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run ^TestConfChangeUnreliableRecover3B$ > ./out/out-$i.txt
     rm -rf /tmp/*test-raftstore*
     # 检查 make 命令是否成功
     if grep -q "FAIL" ./out/out-$i.txt; then
