@@ -8,12 +8,12 @@ fail_count=0
 mkdir -p ./out
 
 # 循环执行50次
-for ((i=1; i<=5; i++)); 
+for ((i=1; i<=10; i++)); 
 do 
     echo "ROUND $i"
     
     # 执行 make project3b，并将输出保存到文件
-    LOG_LEVEL=fatal make project3b > ./out/out-$i.txt
+    LOG_LEVEL=fatal make project2 >> ./out/out-$i.txt && LOG_LEVEL=fatal make project3 >> ./out/out-$i.txt
     
     # 检查输出文件中是否包含 "FAIL"
     if grep -q "FAIL" ./out/out-$i.txt; then

@@ -84,17 +84,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						panic(err)
 					}
 					p := d.FindProposal(entry.Index, entry.Term)
-					d.ScheduleApplyLog(&entry, requests, p)
-					// 创建这个RaftCmdRequest对应的WriteBatch
-					// if requests.AdminRequest != nil {
-					// 	d.applyAdminRequests(requests, entry, wb)
+					d.ScheduleApplyLog(entry, requests, p)
 
-					// } else if len(requests.Requests) > 0 {
-					// 	// 将requests中的数据进行apply
-					// 	changed = d.applyNormalRequests(requests, entry, wb)
-					// }
 					changed = false
 				} else {
+					// 使用ScheduleApplyConfChange来让之前异步的apply完成
+					d.ScheduleApplyConfChange(entry)
 					d.applyConfChangeRequest(&entry, wb)
 				}
 				if d.stopped {
@@ -766,14 +761,27 @@ func (d *peerMsgHandler) onRaftBaseTick() {
 }
 
 // 发送异步apply请求
-func (d *peerMsgHandler) ScheduleApplyLog(entry *eraftpb.Entry, request *raft_cmdpb.RaftCmdRequest, proposal *proposal) {
+func (d *peerMsgHandler) ScheduleApplyLog(entry eraftpb.Entry, request *raft_cmdpb.RaftCmdRequest, proposal *proposal) {
 	applyLogTask := &ApplyTask{
 		peermsghandler: d,
 		entry:          entry,
 		request:        request,
 		proposal:       proposal,
 	}
+
 	d.ctx.applyWorkerSender <- applyLogTask
+}
+
+// 用于在ConfChange之前进行同步操作
+func (d *peerMsgHandler) ScheduleApplyConfChange(entry eraftpb.Entry) {
+	ch := make(chan struct{}, 1)
+	applyLogTask := &ApplyTask{
+		peermsghandler: d,
+		entry:          entry,
+		Notifier:       ch,
+	}
+	d.ctx.applyWorkerSender <- applyLogTask
+	<-ch
 }
 
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
