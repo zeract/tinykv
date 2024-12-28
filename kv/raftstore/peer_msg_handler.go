@@ -279,7 +279,6 @@ func (d *peerMsgHandler) applyConfChangeRequest(entry *eraftpb.Entry, wb *engine
 		}
 	}
 
-	d.RaftGroup.ApplyConfChange(*conf)
 	// peer := region.GetPeers()
 	if conf.ChangeType == eraftpb.ConfChangeType_AddNode {
 		if !IsPeerCreate(region, conf.NodeId) {
@@ -314,6 +313,7 @@ func (d *peerMsgHandler) applyConfChangeRequest(entry *eraftpb.Entry, wb *engine
 		}
 
 	}
+	d.RaftGroup.ApplyConfChange(*conf)
 	resp := &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{},
 		AdminResponse: &raft_cmdpb.AdminResponse{

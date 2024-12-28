@@ -376,9 +376,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
-	if _, ok := r.Prs[r.id]; !ok {
-		return
-	}
+	// if _, ok := r.Prs[r.id]; !ok {
+	// 	return
+	// }
 	r.electionElapsed++
 	switch r.State {
 	case StateFollower, StateCandidate, StatePreCandidate:
@@ -403,6 +403,11 @@ func (r *Raft) tick() {
 			if r.checkQuorum {
 				if hbrNum*2 <= total {
 					r.becomeFollower(r.Term, None)
+					if r.preVote {
+						r.campaign(campaignPreElection)
+					} else {
+						r.campaign(campaignElection)
+					}
 					return
 				}
 			}
@@ -458,7 +463,7 @@ func (r *Raft) reset(term uint64) {
 	r.heartbeatResp = make(map[uint64]bool)
 	r.heartbeatResp[r.id] = true
 	r.leadTransferee = None
-
+	r.PendingConfIndex = 0
 	r.votes = make(map[uint64]bool)
 	for id := range r.Prs {
 		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
@@ -521,7 +526,8 @@ func (r *Raft) becomeLeader() {
 	r.reset(r.Term)
 	r.State = StateLeader
 	r.Lead = r.id
-	// r.PendingConfIndex = 0
+	// 直到之前所有的entry被提交了才会进行新的ConfChange
+	r.PendingConfIndex = r.RaftLog.LastIndex()
 	// Leader propose a noop entry
 	if r.debug {
 		log.Infof("[%d] become Leader", r.id)
@@ -540,6 +546,16 @@ func (r *Raft) campaign(t CampaignType) {
 	if _, ok := r.Prs[r.id]; !ok || r.RaftLog.pendingSnapshot != nil {
 		return
 	}
+
+	var entries []pb.Entry
+	for i := r.RaftLog.applied + 1; i < r.RaftLog.committed+1; i++ {
+		entries = append(entries, r.RaftLog.entries[i-r.RaftLog.FirstIndex()])
+	}
+	if n := numOfPendingConf(entries); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+		log.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+		return
+	}
+
 	var term uint64
 	var voteMsg pb.MessageType
 	if t == campaignPreElection {
@@ -577,7 +593,12 @@ func (r *Raft) campaign(t CampaignType) {
 				index := r.RaftLog.LastIndex()
 				logTerm, _ := r.RaftLog.Term(index)
 				if r.debug {
-					log.Infof("Candidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
+					if r.State == StatePreCandidate {
+						log.Infof("StatePreCandidate [%d] Send [logterm %d, index %d] to %d\n", r.id, term, index, id)
+					} else {
+						log.Infof("%v [%d] Send [logterm %d, index %d] to %d\n", r.State, r.id, term, index, id)
+					}
+
 				}
 				// 如果是TransfterLeader，则携带对应的Context
 				var ctx []byte
@@ -627,21 +648,31 @@ func (r *Raft) Step(m pb.Message) error {
 	// 	return nil
 	// }
 	if r.debug {
-		log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+		if m.MsgType != pb.MessageType_MsgHeartbeat {
+			log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
+		}
 	}
 
 	// Your Code Here (2A).
 	switch {
 	case m.Term == 0:
 	case m.Term > r.Term:
-		// log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]\n",
-		// 	r.id, r.Term, m.MsgType, m.From, m.Term)
+		if r.debug {
+			log.Infof("%d [term: %d] received a %s message with higher term from %d [term: %d]\n",
+				r.id, r.Term, m.MsgType, m.From, m.Term)
+		}
 		// 如果是MessageType_MsgRequestVote请求，则将lead置为None
 		if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
 			force := bytes.Equal(m.Context, []byte(campaignTransfer))
 			inLease := r.checkQuorum && r.Lead != None && r.electionElapsed < r.electionTimeout
 			if !force && inLease {
 				// 当前leader的lease还没有过期，不允许新的leader产生
+				if r.debug {
+					lst := r.RaftLog.LastIndex()
+					term, _ := r.RaftLog.Term(lst)
+					log.Infof("%d [logterm: %d, index: %d, vote: %d] ignored %s from %d [logterm: %d, index: %d] at term %d: lease is not expired (remaining ticks: %d)",
+						r.id, term, lst, r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term, r.electionTimeout-r.electionElapsed)
+				}
 				return nil
 			}
 		}
@@ -650,6 +681,9 @@ func (r *Raft) Step(m pb.Message) error {
 		case m.MsgType == pb.MessageType_MsgPreRequestVoteResponse && !m.Reject:
 		default:
 			if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
+				if r.debug {
+					log.Infof("Receive %s from %d, Term higher , [%d]become follower\n", m.MsgType, m.From, r.id)
+				}
 				r.becomeFollower(m.Term, m.From)
 			} else {
 				r.becomeFollower(m.Term, None)
@@ -664,14 +698,20 @@ func (r *Raft) Step(m pb.Message) error {
 			msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgPreRequestVoteResponse, Term: r.Term, Reject: true}
 			r.msgs = append(r.msgs, msg)
 		} else {
-			// log.Infof("%x [term: %d] ignored a %s message with lower term from %x [term: %d]",
-			// 	r.id, r.Term, m.MsgType, m.From, m.Term)
+			if r.debug {
+				log.Infof("%d [term: %d] ignored a %s message with lower term from %d [term: %d]",
+					r.id, r.Term, m.MsgType, m.From, m.Term)
+			}
+
 		}
 		return nil
 	}
 	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
+		if _, ok := r.Prs[r.id]; !ok {
+			return nil
+		}
 		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
-		CanVote := (m.MsgType == pb.MessageType_MsgPreRequestVote && m.Term > r.Term) || (r.Vote == None && r.Lead == None) || r.Vote == m.From
+		CanVote := (m.MsgType == pb.MessageType_MsgPreRequestVote && m.Term > r.Term) || (r.Vote == None && (r.Lead == None || r.Lead == m.From)) || r.Vote == m.From
 		if CanVote && r.isUpToDate(entry) {
 			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Term: m.Term}
 			r.msgs = append(r.msgs, msg)
@@ -685,7 +725,12 @@ func (r *Raft) Step(m pb.Message) error {
 			// r.becomeFollower(m.Term, None)
 		} else {
 			if r.debug {
-				log.Infof("[%d] Reject Vote for [%d]", r.id, m.From)
+				if CanVote {
+					log.Infof("[%d] Reject Vote for [%d] Because Log not Up to date", r.id, m.From)
+				} else {
+					log.Infof("[%d] Reject Vote for [%d], [vote: %d, lead: %d]", r.id, m.From, r.Vote, r.Lead)
+				}
+
 			}
 			msg := pb.Message{From: r.id, To: m.From, MsgType: voteRespMsgType(m.MsgType), Reject: true, Term: r.Term}
 			r.msgs = append(r.msgs, msg)
@@ -705,7 +750,7 @@ func (r *Raft) Step(m pb.Message) error {
 				entries = append(entries, r.RaftLog.entries[i-r.RaftLog.FirstIndex()])
 			}
 			if n := numOfPendingConf(entries); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				log.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				log.Warningf("%d cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
 
@@ -769,7 +814,7 @@ func (r *Raft) Step(m pb.Message) error {
 				entries = append(entries, r.RaftLog.entries[i-r.RaftLog.FirstIndex()])
 			}
 			if n := numOfPendingConf(entries); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
-				log.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				log.Warningf("%d cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
 			if r.preVote {
@@ -846,7 +891,7 @@ func (r *Raft) Step(m pb.Message) error {
 
 		case pb.MessageType_MsgPropose:
 			if r.debug {
-				log.Infof("Receive Propose signal!\n")
+				log.Infof("%d Receive Propose signal!\n", r.id)
 			}
 			if _, ok := r.Prs[r.id]; !ok {
 				// 节点被移除集群
@@ -880,9 +925,9 @@ func (r *Raft) Step(m pb.Message) error {
 					if r.PendingConfIndex > r.RaftLog.applied {
 						m.Entries[i] = &pb.Entry{EntryType: pb.EntryType_EntryNormal}
 						// return nil
-					}
-					r.PendingConfIndex = r.RaftLog.LastIndex() + uint64(i) + 1
-					// log.Infof("Propose ConfChange Entry")
+					} else {
+						r.PendingConfIndex = r.RaftLog.LastIndex() + uint64(i) + 1
+					} // log.Infof("Propose ConfChange Entry")
 				}
 			}
 			var entries []pb.Entry
@@ -908,6 +953,9 @@ func (r *Raft) Step(m pb.Message) error {
 				return nil
 			}
 			if !m.Reject {
+				if r.debug {
+					log.Infof("[%d] Receive MsgAppendResonse from [%d]", r.id, m.From)
+				}
 				pr := r.Prs[m.From]
 				// 更新leader与follower的通信间隔
 				pr.lastCommunicteTs = int64(r.curTime)
@@ -935,23 +983,26 @@ func (r *Raft) Step(m pb.Message) error {
 
 			} else {
 				// Follower的log length太短, nextIndex = Xlen
-				// if m.Xlen < m.Index {
-				// 	// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
-				// 	r.Prs[m.From].Next = m.Xlen + 1
-				// } else {
-				// 	index := r.RaftLog.FindLastTerm(m.Xterm)
-				// 	if index == 0 {
-				// 		// Leader没有XTerm，nextIndex = Xindex
-				// 		// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
-				// 		r.Prs[m.From].Next = m.Xindex
-				// 	} else {
-				// 		// Leader有Xterm, nextIndex = leader's last entry for XTerm
-				// 		// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
-				// 		r.Prs[m.From].Next = index
-				// 	}
-				// }
+				if m.Xlen < m.Index {
+					// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xlen+1)
+					r.Prs[m.From].Next = m.Xlen + 1
+				} else {
+					index := r.RaftLog.FindLastTerm(m.Xterm)
+					if index == 0 {
+						// Leader没有XTerm，nextIndex = Xindex
+						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, m.Xindex)
+						r.Prs[m.From].Next = m.Xindex
+					} else {
+						// Leader有Xterm, nextIndex = leader's last entry for XTerm
+						// log.Infof("Next Changed: %d -> %d", r.Prs[m.From].Next, index)
+						r.Prs[m.From].Next = index
+					}
+				}
 				// append失败的index,减1继续发送append请求
-				r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
+				if r.debug {
+					log.Infof("[%d] Receive Reject MsgAppendResonse from [%d]", r.id, m.From)
+				}
+				// r.Prs[m.From].Next = min(m.Index+1, r.Prs[m.From].Next-1)
 				r.sendAppend(m.From)
 
 			}
@@ -1067,6 +1118,9 @@ func (pr *Progress) maybeUpdate(n uint64) bool {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	// 如果发过来的消息索引小于当前commit索引，就返回当前commit索引
+	if r.debug {
+		log.Infof("[%d] Receive AppendEntries from [%d]", r.id, m.From)
+	}
 	if m.Term >= r.Term {
 		r.Term = m.Term
 		if r.State != StateFollower {
@@ -1095,6 +1149,18 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Term不匹配，返回Rejected
 	if tempTerm, _ := r.RaftLog.Term(m.Index); tempTerm != m.LogTerm {
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
+		term, _ := r.RaftLog.Term(m.Index)
+		xlen := r.RaftLog.LastIndex()
+		// 如果Follower的log length小于nextIndex,那么说明follower's log太短,这里没有冲突的Term
+		if xlen < m.Index {
+			// log.Infof("Follower too short, xlen is %d", xlen)
+			msg.Xlen = xlen
+		} else {
+			// 寻找冲突的Term和该Term在Follower's log中的第一个entry index
+			xindex := r.RaftLog.FindFirstTerm(term)
+			msg.Xindex = xindex
+			msg.Xterm = term
+		}
 		r.msgs = append(r.msgs, msg)
 		return
 	}
