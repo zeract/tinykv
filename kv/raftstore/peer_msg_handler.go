@@ -127,7 +127,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 }
 
-func (d *peerMsgHandler) execSplit(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
+func (d *peerMsgHandler) execSplit(msg *raft_cmdpb.RaftCmdRequest, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
 	// p := d.FindProposal(entry.Index, entry.Term)
 	if msg.Header.RegionId != d.regionId {
 		resp := ErrResp(&util.ErrRegionNotFound{RegionId: msg.Header.RegionId})
@@ -328,7 +328,7 @@ func (d *peerMsgHandler) applyConfChangeRequest(entry *eraftpb.Entry, wb *engine
 	d.notifyHeartbeatScheduler(region, d.peer)
 }
 
-func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch, p *proposal) bool {
+func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest, wb *engine_util.WriteBatch, p *proposal) bool {
 	// p := d.FindProposal(entry.Index, entry.Term)
 	err := util.CheckRegionEpoch(requests, d.Region(), true)
 	if err != nil {
@@ -407,7 +407,7 @@ func (d *peerMsgHandler) applyNormalRequests(requests *raft_cmdpb.RaftCmdRequest
 	return changed
 }
 
-func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
+func (d *peerMsgHandler) execCompactLog(req *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch, p *proposal) {
 	// p := d.FindProposal(entry.Index, entry.Term)
 	compactLog := req.GetCompactLog()
 	compactIndex := compactLog.CompactIndex
@@ -437,14 +437,13 @@ func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.Ad
 	}
 }
 
-func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry, wb *engine_util.WriteBatch, p *proposal) {
+func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest, wb *engine_util.WriteBatch, p *proposal) {
 	// 判断 RegionEpoch
 	if requests.Header != nil {
 		fromEpoch := requests.GetHeader().GetRegionEpoch()
 		if fromEpoch != nil {
 			if util.IsEpochStale(fromEpoch, d.Region().RegionEpoch) {
 				resp := ErrResp(&util.ErrEpochNotMatch{})
-				p := d.FindProposal(entry.Index, entry.Term)
 				if p != nil {
 					p.cb.Done(resp)
 				}
@@ -456,10 +455,10 @@ func (d *peerMsgHandler) applyAdminRequests(requests *raft_cmdpb.RaftCmdRequest,
 	switch requests.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
 		// 执行Compactlog操作
-		d.execCompactLog(&entry, requests.AdminRequest, wb, p)
+		d.execCompactLog(requests.AdminRequest, wb, p)
 	case raft_cmdpb.AdminCmdType_Split:
 		// 执行Split操作
-		d.execSplit(&entry, requests, requests.AdminRequest, wb, p)
+		d.execSplit(requests, requests.AdminRequest, wb, p)
 	}
 	return
 }

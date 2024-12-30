@@ -510,9 +510,9 @@ func (r *Raft) becomeCandidate() {
 	if _, ok := r.Prs[r.id]; !ok {
 		return
 	}
+	r.reset(r.Term + 1)
 	r.State = StateCandidate
 	r.Vote = r.id
-	r.reset(r.Term + 1)
 	// r.PendingConfIndex = 0
 }
 
@@ -535,6 +535,9 @@ func (r *Raft) becomeLeader() {
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
 	r.RaftLog.append(entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
+	if r.Prs[r.id] != nil {
+		r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+	}
 	r.maybeCommit()
 
 }
@@ -707,9 +710,9 @@ func (r *Raft) Step(m pb.Message) error {
 		return nil
 	}
 	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
-		if _, ok := r.Prs[r.id]; !ok {
-			return nil
-		}
+		// if _, ok := r.Prs[r.id]; !ok {
+		// 	return nil
+		// }
 		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
 		CanVote := (m.MsgType == pb.MessageType_MsgPreRequestVote && m.Term > r.Term) || (r.Vote == None && (r.Lead == None || r.Lead == m.From)) || r.Vote == m.From
 		if CanVote && r.isUpToDate(entry) {
@@ -1127,8 +1130,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			r.becomeFollower(m.Term, None)
 		}
 	} else {
-		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
-		r.msgs = append(r.msgs, msg)
+		// msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
+		// r.msgs = append(r.msgs, msg)
 		return
 	}
 
@@ -1141,11 +1144,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.msgs = append(r.msgs, msg)
 		return
 	}
-	if m.Index > r.RaftLog.LastIndex() {
-		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
-		r.msgs = append(r.msgs, msg)
-		return
-	}
+	// if m.Index > r.RaftLog.LastIndex() {
+	// 	msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
+	// 	r.msgs = append(r.msgs, msg)
+	// 	return
+	// }
 	// Term不匹配，返回Rejected
 	if tempTerm, _ := r.RaftLog.Term(m.Index); tempTerm != m.LogTerm {
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}

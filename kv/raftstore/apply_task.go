@@ -49,12 +49,12 @@ func (r *ApplyTaskHandler) apply(task *ApplyTask) {
 	// 创建这个RaftCmdRequest对应的WriteBatch
 	if task.request.AdminRequest != nil {
 		// log.Infof("%v Applying AdminRequest task: [index:%d, term:%d]", task.peermsghandler.Tag, task.entry.Index, task.entry.Term)
-		d.applyAdminRequests(task.request, task.entry, wb, task.proposal)
+		d.applyAdminRequests(task.request, wb, task.proposal)
 		// log.Infof("%v After apply Split or Compact", task.peermsghandler.Tag)
 	} else if len(task.request.Requests) > 0 {
 		// log.Infof("%v Applying NormalRequest task: [index:%d, term:%d]", task.peermsghandler.Tag, task.entry.Index, task.entry.Term)
 		// 将requests中的数据进行apply
-		changed = d.applyNormalRequests(task.request, task.entry, wb, task.proposal)
+		changed = d.applyNormalRequests(task.request, wb, task.proposal)
 	}
 
 	if task.entry.Index >= d.peerStorage.applyState.AppliedIndex {

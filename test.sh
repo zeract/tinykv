@@ -8,7 +8,7 @@ fail_count=0
 mkdir -p ./out
 
 # 循环执行50次
-for ((i=1; i<=10; i++)); 
+for ((i=1; i<=20; i++)); 
 do 
     echo "ROUND $i"
     

@@ -287,7 +287,7 @@ func (l *RaftLog) FindFirstTerm(term uint64) uint64 {
 	// 从committed之后开始查找Term对应的Entry，因为即使entry是stabled的被持久化在storage中
 	// 但是如果没有被committed，还是可以被修改进行同步
 	if term == 0 {
-		return 0
+		return 1
 	}
 	for _, e := range l.entries {
 		if e.Term == term {
