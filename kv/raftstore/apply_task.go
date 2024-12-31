@@ -47,11 +47,6 @@ func (r *ApplyTaskHandler) apply(task *ApplyTask) {
 	wb := new(engine_util.WriteBatch)
 	d := task.peermsghandler
 	// 判断是否需要写盘
-	// requests := new(raft_cmdpb.RaftCmdRequest)
-	// err := requests.Unmarshal(task.entry.Data)
-	// if err != nil {
-	// 	panic(err)
-	// }
 	changed := true
 	if task.request.AdminRequest != nil {
 		d.applyAdminRequests(task.request, wb, task.proposal)

@@ -365,7 +365,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	// 发送一个空的Heartbeat RPC
-	// commit := min(r.Prs[to].Match, r.RaftLog.committed)
 	if _, ok := r.Prs[to]; !ok {
 		return
 	}
@@ -376,9 +375,6 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
-	// if _, ok := r.Prs[r.id]; !ok {
-	// 	return
-	// }
 	r.electionElapsed++
 	switch r.State {
 	case StateFollower, StateCandidate, StatePreCandidate:
@@ -773,10 +769,7 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgTimeoutNow:
 			// 当前节点必须在集群中
 			if _, ok := r.Prs[r.id]; ok {
-				// // 向自己发送msgHup请求
-				// msg := pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}
-				// // MsgHup是一个local message，不能添加到r.msgs中
-				// r.Step(msg)
+				// 向自己发送msgHup请求
 				// 发起选举
 				r.campaign(campaignTransfer)
 			}
@@ -926,11 +919,13 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 			}
 			last := r.RaftLog.LastIndex()
+			var entries []pb.Entry
 			for i := range m.Entries {
 				m.Entries[i].Term = r.Term
 				m.Entries[i].Index = last + 1 + uint64(i)
-				r.RaftLog.entries = append(r.RaftLog.entries, *m.Entries[i])
+				entries = append(entries, *m.Entries[i])
 			}
+			r.RaftLog.entries = append(r.RaftLog.entries, entries...)
 			// entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
 			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 			r.maybeCommit()
