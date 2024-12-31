@@ -393,15 +393,14 @@ func (r *Raft) tick() {
 	case StateLeader:
 		r.heartbeatElapsed++
 		r.curTime++
-		hbrNum := len(r.heartbeatResp)
-		total := len(r.Prs)
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
+			hbrNum := len(r.heartbeatResp)
 			r.heartbeatResp = make(map[uint64]bool)
 			r.heartbeatResp[r.id] = true
 			// 心跳回应数不超过一半，说明成为孤岛，重新开始选举
 			if r.checkQuorum {
-				if hbrNum*2 <= total {
+				if hbrNum < r.quorum() {
 					r.becomeFollower(r.Term, None)
 					if r.preVote {
 						r.campaign(campaignPreElection)
@@ -485,7 +484,6 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.reset(term)
 	// change the leader
 	r.Lead = lead
-	// r.PendingConfIndex = 0
 
 }
 
@@ -513,7 +511,6 @@ func (r *Raft) becomeCandidate() {
 	r.reset(r.Term + 1)
 	r.State = StateCandidate
 	r.Vote = r.id
-	// r.PendingConfIndex = 0
 }
 
 // becomeLeader transform this peer's state to leader
@@ -528,12 +525,13 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	// 直到之前所有的entry被提交了才会进行新的ConfChange
 	r.PendingConfIndex = r.RaftLog.LastIndex()
+	r.haveSendedSnapShot = make(map[uint64]int)
 	// Leader propose a noop entry
 	if r.debug {
 		log.Infof("[%d] become Leader", r.id)
 	}
 	entry := pb.Entry{Data: nil, Index: r.RaftLog.LastIndex() + 1, Term: r.Term}
-	r.RaftLog.append(entry)
+	r.RaftLog.entries = append(r.RaftLog.entries, entry)
 	// log.Infof("Raft append entry with index %d, after append last index is %d", entry.Index, r.RaftLog.LastIndex())
 	if r.Prs[r.id] != nil {
 		r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
@@ -647,9 +645,6 @@ func voteRespMsgType(msgt pb.MessageType) pb.MessageType {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// if _, ok := r.Prs[m.From]; !ok {
-	// 	return nil
-	// }
 	if r.debug {
 		if m.MsgType != pb.MessageType_MsgHeartbeat {
 			log.Infof("[%d] Receive %s Message from %d", r.id, m.MsgType, m.From)
@@ -710,9 +705,6 @@ func (r *Raft) Step(m pb.Message) error {
 		return nil
 	}
 	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgPreRequestVote {
-		// if _, ok := r.Prs[r.id]; !ok {
-		// 	return nil
-		// }
 		entry := pb.Entry{Term: m.LogTerm, Index: m.Index}
 		CanVote := (m.MsgType == pb.MessageType_MsgPreRequestVote && m.Term > r.Term) || (r.Vote == None && (r.Lead == None || r.Lead == m.From)) || r.Vote == m.From
 		if CanVote && r.isUpToDate(entry) {
@@ -933,15 +925,13 @@ func (r *Raft) Step(m pb.Message) error {
 					} // log.Infof("Propose ConfChange Entry")
 				}
 			}
-			var entries []pb.Entry
 			last := r.RaftLog.LastIndex()
 			for i := range m.Entries {
 				m.Entries[i].Term = r.Term
 				m.Entries[i].Index = last + 1 + uint64(i)
-				entries = append(entries, *m.Entries[i])
+				r.RaftLog.entries = append(r.RaftLog.entries, *m.Entries[i])
 			}
 			// entry := pb.Entry{Data: m.Entries[0].Data, Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
-			r.RaftLog.append(entries...)
 			r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 			r.maybeCommit()
 			// log.Infof("After Propose, Raftlog Entry Length is %d\n", len(r.RaftLog.entries))
@@ -1130,8 +1120,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			r.becomeFollower(m.Term, None)
 		}
 	} else {
-		// msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
-		// r.msgs = append(r.msgs, msg)
 		return
 	}
 
@@ -1144,11 +1132,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.msgs = append(r.msgs, msg)
 		return
 	}
-	// if m.Index > r.RaftLog.LastIndex() {
-	// 	msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex(), Term: r.Term, Reject: true}
-	// 	r.msgs = append(r.msgs, msg)
-	// 	return
-	// }
+
 	// Term不匹配，返回Rejected
 	if tempTerm, _ := r.RaftLog.Term(m.Index); tempTerm != m.LogTerm {
 		msg := pb.Message{From: r.id, To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Term: r.Term, Reject: true}
@@ -1281,7 +1265,6 @@ func (r *Raft) snapRestore(snap pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	// r.PendingConfIndex = 0
 	if _, ok := r.Prs[id]; ok {
 		if r.debug {
 			log.Infof("[%d] Already have [%d] in Prs", r.id, id)
@@ -1302,8 +1285,6 @@ func (r *Raft) addNode(id uint64) {
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 	delete(r.Prs, id)
-	// 重置PendingConfIndex
-	// r.PendingConfIndex = 0
 
 	if len(r.Prs) == 0 {
 		return

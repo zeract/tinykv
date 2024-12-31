@@ -219,68 +219,6 @@ func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
 	return false
 }
 
-// 尝试去append entry，返回(新entry的index，true)或者(0,false)
-func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
-	term, _ := l.Term(index)
-	if term == logTerm {
-		lastnewi = index + uint64(len(ents))
-		ci := l.findConflict(ents)
-		switch {
-		case ci == 0:
-		case ci <= l.committed:
-			log.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
-		default:
-			offset := index + 1
-			log.Infof("The Append Msg[Indx:%d, LogTerm:%d, Committed:%d] has conflict index %d", index, logTerm, committed, ci)
-			l.append(ents[ci-offset:]...)
-		}
-		l.commitTo(min(committed, lastnewi))
-		return lastnewi, true
-	}
-	return 0, false
-}
-
-func (l *RaftLog) append(ents ...pb.Entry) uint64 {
-	if len(ents) == 0 {
-		return l.LastIndex()
-	}
-	if after := ents[0].Index - 1; after < l.committed {
-		log.Panicf("after(%d) is out of range [committed(%d)]", after, l.committed)
-	}
-	// l.unstable.truncateAndAppend(ents)
-	after := ents[0].Index
-	offset := l.stabled + 1
-	unstable := l.unstableEntries()
-	if after == offset+uint64(len(unstable)) {
-		l.entries = append(l.entries, ents...)
-	} else if after <= offset {
-		l.stabled = after - 1
-		l.entries = append([]pb.Entry{}, l.entries[:l.stabled-l.FirstIndex()+1]...)
-		l.entries = append(l.entries, ents...)
-	} else {
-		f, _ := l.storage.FirstIndex()
-		log.Infof("The after is %d, first Index is %d, stabled is %d, Storage First Index is %d", after, l.FirstIndex(), l.stabled, f)
-		l.entries = append([]pb.Entry{}, l.entries[:after-l.FirstIndex()]...)
-		l.entries = append(l.entries, ents...)
-		l.stabled = after - 1
-	}
-	return l.LastIndex()
-}
-
-func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
-	for _, ne := range ents {
-		term, _ := l.Term(ne.Index)
-		if term != ne.Term {
-			if ne.Index <= l.LastIndex() {
-				// log.Infof("found conflict at index %d [existing term: %d, conflicting term: %d]",
-				// 	ne.Index, term, ne.Term)
-			}
-			return ne.Index
-		}
-	}
-	return 0
-}
-
 // 根据传入的Term，寻找该Term的第一个Entry
 func (l *RaftLog) FindFirstTerm(term uint64) uint64 {
 	// lst := l.LastIndex()
@@ -331,47 +269,6 @@ func (l *RaftLog) firstIndex() uint64 {
 	return index
 }
 
-func (l *RaftLog) hasNextEnts() bool {
-	off := max(l.applied+1, l.firstIndex())
-	return l.committed+1 > off
-}
-
-func (l *RaftLog) maybeunstableTerm(i uint64) (uint64, bool) {
-	// log.Infof("Try to get unstable Term, the index is %d, stable index is %d, lastindex is %d", i, l.stabled, l.LastIndex())
-	if i <= l.stabled {
-		if l.pendingSnapshot == nil {
-			return 0, false
-		}
-		if l.pendingSnapshot.Metadata.Index == i {
-			// log.Infof("Try to get unstable Term, Get Term from snapShot, Term is %d", l.pendingSnapshot.Metadata.Term)
-			return l.pendingSnapshot.Metadata.Term, true
-		}
-		return 0, false
-	}
-
-	last, ok := l.mayLastIndex()
-	if !ok {
-		return 0, false
-	}
-	if i > last {
-		return 0, false
-	}
-	// 使用unstable entry来获取term
-	unstable := l.unstableEntries()
-	return unstable[i-l.stabled-1].Term, true
-}
-
-func (l *RaftLog) mayLastIndex() (uint64, bool) {
-	unstable := l.unstableEntries()
-	if length := len(unstable); length != 0 {
-		return l.stabled + uint64(length), true
-	}
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index, true
-	}
-	return 0, false
-}
-
 // 获取从i开始的entries返回
 func (l *RaftLog) Entries(i uint64) ([]*pb.Entry, error) {
 	last := l.LastIndex()
@@ -387,69 +284,6 @@ func (l *RaftLog) Entries(i uint64) ([]*pb.Entry, error) {
 		entries = append(entries, &l.entries[j-l.FirstIndex()])
 	}
 	return entries, nil
-}
-
-func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
-	err := l.mustCheckOutOfBounds(lo, hi)
-	if err != nil {
-		return nil, err
-	}
-	if lo == hi {
-		return nil, nil
-	}
-	var ents []pb.Entry
-	offset := l.stabled + 1
-	if lo < offset {
-		// lo 小于unstable的offset，说明前半部分在持久化的storage中
-
-		// 传入storage.Entries的hi参数取hi和unstable offset的较小值
-		storedEnts, err := l.storage.Entries(lo, min(hi, offset))
-		if err == ErrCompacted {
-			return nil, err
-		} else if err == ErrUnavailable {
-			log.Panicf("entries[%d:%d) is unavailable from storage", lo, min(hi, offset))
-		} else if err != nil {
-			panic(err)
-		}
-
-		// check if ents has reached the size limitation
-		if uint64(len(storedEnts)) < min(hi, offset)-lo {
-			return storedEnts, nil
-		}
-
-		ents = storedEnts
-	}
-
-	if hi > offset {
-		// hi大于unstable offset，说明后半部分在unstable中取得
-		lo = max(lo, offset)
-		entries := l.unstableEntries()
-		unstable := entries[lo-offset : hi-offset]
-		if len(ents) > 0 {
-			ents = append([]pb.Entry{}, ents...)
-			ents = append(ents, unstable...)
-		} else {
-			ents = unstable
-		}
-	}
-	return ents, nil
-}
-
-// l.firstIndex <= lo <= hi <= l.firstIndex + len(l.entries)
-func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
-	if lo > hi {
-		log.Panicf("invalid slice %d > %d", lo, hi)
-	}
-	fi := l.firstIndex()
-	if lo < fi {
-		return ErrCompacted
-	}
-
-	length := l.LastIndex() + 1 - fi
-	if lo < fi || hi > fi+length {
-		log.Panicf("slice[%d,%d) out of bound [%d,%d]", lo, hi, fi, l.LastIndex())
-	}
-	return nil
 }
 
 func (l *RaftLog) snapshot() (pb.Snapshot, error) {

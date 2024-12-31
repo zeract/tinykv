@@ -77,7 +77,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				changed := true
 				// 遍历所有的committed Entries，如果是Normal request则继续进行处理
 				if entry.EntryType == eraftpb.EntryType_EntryNormal {
-					// 从Entry中取出对应的RaftCmdRequest，其中包含多个Requests
 					requests := new(raft_cmdpb.RaftCmdRequest)
 					err := requests.Unmarshal(entry.Data)
 					if err != nil {
@@ -85,7 +84,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					}
 					p := d.FindProposal(entry.Index, entry.Term)
 					d.ScheduleApplyLog(entry, requests, p)
-
 					changed = false
 				} else {
 					// 使用ScheduleApplyConfChange来让之前异步的apply完成
@@ -618,19 +616,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				msg.Requests = msg.Requests[1:]
 				continue
 			}
-			// cmd := new(raft_cmdpb.RaftCmdRequest)
-			// cmd.Header = msg.Header
-			// cmd.Requests = append(cmd.Requests, req)
-			// data, err1 := cmd.Marshal()
-			// if err1 != nil && data != nil {
-			// 	cb.Done(ErrResp(err1))
-			// 	return
-			// }
-			// d.proposals = append(d.proposals, &proposal{
-			// 	index: d.nextProposalIndex(),
-			// 	term:  d.Term(),
-			// 	cb:    cb,
-			// })
 			cmd_msg.Requests = append(cmd_msg.Requests, req)
 			// _ = d.RaftGroup.Propose(data)
 			msg.Requests = msg.Requests[1:]
